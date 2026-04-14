@@ -1,0 +1,36 @@
+{
+  "paths": {
+    "workspace_root": "c:/tool/RPS市场分析系统",
+    "tdx_analysis_dir": "e:/个人/个人备份/Users/diaox/PycharmProjects/获取热点板块及股票/通达信板块分析",
+    "rps_project_root": "e:/个人/个人备份/Users/diaox/PycharmProjects/获取热点板块及股票",
+    "tdx_extdata_dir": "C:/tool/Tdx MPV V1.24++/T0002/extdata",
+    "tdx_hq_cache_dir": "C:/tool/Tdx MPV V1.24++/T0002/hq_cache",
+    "tdx_blocks_db": "c:/tool/RPS市场分析系统/tdx_blocks.db"
+  },
+  "schedule": {
+    "read_tdx_blocks_time": "09:01",
+    "read_tdx_rps_times": [
+      "09:25",
+      "10:25",
+      "11:25",
+      "13:30",
+      "14:30",
+      "15:30"
+    ]
+  },
+  "report": {
+    "max_days": 250,
+    "default_days": 30,
+    "output_filename": "RPS_多周期分析报告_01.html"
+  },
+  "sqlserver": {
+    "host": "127.0.0.1",
+    "database": "tdx",
+    "user": "sa",
+    "password": "ewell123",
+    "table": "board_rps_daily",
+    "stock_rps_daily_table": "stock_rps_daily",
+    "sector_stocks_table": "sector_stocks_daily",
+    "sector_stocks_import": true
+  }
+}
