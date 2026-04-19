@@ -19,14 +19,55 @@
         - RPS20:  extdata_7.dat
         - RPS5:   extdata_8.dat
         - RPS10:  extdata_10.dat
+   个股换手率（扩展数据第 11 号，与个股 RPS 同结构）：
+        - 换手率: extdata_11.dat → 宽表列 turnover_rate（与 code+date 对齐）
+
+   合并宽表前会将 ``code`` 规范为 6 位数字（``normalize_extdata_code_for_merge``），
+   再按 (code, date) 合并，避免不同文件里同一证券写法不一致导致多行、与统一 ``stock_code`` 入库冲突。
 """
 
 import os
+import re
 import struct
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 from project_config import load_project_config, get_cfg
+
+
+def normalize_extdata_code_for_merge(code: object) -> str:
+    """
+    将扩展数据 idx/dat 中的 code 规范为 **6 位数字主键**，再做多文件 outer 合并。
+
+    不同文件或通达信版本里，同一证券可能出现不同写法（如 ``000001`` / ``1A0001`` / 带市场前缀等）；
+    若按 **原始字符串** 做 ``merge/join``，会拆成多行，归一化入库后又与 ``stock_code`` 统一写法冲突。
+
+    规则与 ``RPS_FINAL_06.block_rps_analysis_service.normalize_board_code_for_db`` 一致（首段连续 6 位数字）。
+    """
+    if code is None:
+        return ""
+    s = str(code).strip()
+    if not s:
+        return ""
+    s = s.upper()
+    m = re.search(r"(\d{6})", s)
+    if m:
+        return m.group(1)
+    if len(s) > 6:
+        s = s[:6]
+    return s.zfill(6)
+
+
+def _normalize_rps_chunk_for_merge(df: pd.DataFrame) -> pd.DataFrame:
+    """单周期表：code 列规范化后按 (code,date) 去重（保留最后一条）。"""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out["code"] = out["code"].map(normalize_extdata_code_for_merge)
+    out = out[out["code"] != ""]
+    if out.empty:
+        return out
+    return out.drop_duplicates(subset=["code", "date"], keep="last")
 
 # 默认扩展数据目录
 _CFG = load_project_config()
@@ -51,6 +92,9 @@ STOCK_RPS_FILE_MAP = {
     'RPS10':  ('extdata_10.dat', 'extdata_10.idx'),
     'RPS5':   ('extdata_8.dat', 'extdata_8.idx'),
 }
+
+# 扩展数据第 11 列：个股换手率（与上表相同二进制结构，见 load_stock_turnover_rate_extdata11）
+STOCK_TURNOVER_EXTDATA11 = ('extdata_11.dat', 'extdata_11.idx')
 
 
 def read_extdata_dat(dat_path, idx_path=None):
@@ -195,6 +239,37 @@ def load_all_stock_rps(base_dir=None, scale_0_100=True):
     return result
 
 
+def load_stock_turnover_rate_extdata11(base_dir=None, scale_like_rps: bool = False):
+    """
+    读取个股扩展数据第 11 号（extdata_11）作为换手率。
+
+    通达信存储为与 RPS 相同的二进制行：date, time, float value。
+    默认 **不** 做 /10 缩放；若公式按与 RPS 相同的 0~1000 存百分数，可设 scale_like_rps=True（仅除以 10，不 clip）。
+
+    Returns:
+        DataFrame(code, date, turnover_rate)，文件不存在则 None。
+    """
+    base_dir = base_dir or DEFAULT_EXTDATA_DIR
+    dat_name, idx_name = STOCK_TURNOVER_EXTDATA11
+    dat_path = os.path.join(base_dir, dat_name)
+    idx_path = os.path.join(base_dir, idx_name)
+    if not os.path.exists(dat_path):
+        return None
+    try:
+        df = read_extdata_dat(dat_path, idx_path)
+    except (OSError, FileNotFoundError, ValueError):
+        return None
+    if df.empty:
+        return df.rename(columns={'value': 'turnover_rate'})
+    if scale_like_rps:
+        df = df.copy()
+        df['value'] = df['value'] / 10.0
+    df = df.rename(columns={'value': 'turnover_rate'})
+    if not df.empty:
+        df = df.drop_duplicates(subset=["code", "date"], keep="last")
+    return df
+
+
 def load_all_rps_merged(base_dir=None, scale_0_100=True):
     """
     加载全部 RPS 数据并合并为宽表
@@ -209,15 +284,17 @@ def load_all_rps_merged(base_dir=None, scale_0_100=True):
 
     merged = None
     for name, df in rps_dict.items():
-        df = df[['code', 'date', name]].copy()
+        df = _normalize_rps_chunk_for_merge(df[["code", "date", name]])
+        if df.empty:
+            continue
         if merged is None:
             merged = df
         else:
-            merged = merged.merge(
-                df, on=['code', 'date'], how='outer'
-            )
+            merged = merged.merge(df, on=["code", "date"], how="outer")
 
-    return merged.sort_values(['code', 'date']).reset_index(drop=True)
+    if merged is None:
+        return pd.DataFrame()
+    return merged.sort_values(["code", "date"]).reset_index(drop=True)
 
 
 def load_all_stock_rps_merged(base_dir=None, scale_0_100=True):
@@ -225,11 +302,14 @@ def load_all_stock_rps_merged(base_dir=None, scale_0_100=True):
     加载全部个股 RPS 并合并为宽表。
 
     使用 (code,date) 多级索引 **outer join** 替代多次 ``merge``，减少中间大表与重复排序开销。
+    合并前对各文件 ``code`` 做 **6 位规范化**，与 ``stock_rps_daily.stock_code`` 一致。
+    若存在 extdata_11.dat，则左并入列 turnover_rate（扩展数据第 11 列，换手率）。
 
     Returns:
-        DataFrame: 列 code, date, RPS120, RPS60, RPS20, RPS10（若有）, RPS5
-        按 code, date 合并，缺失值为 NaN
+        DataFrame: 列 code, date, RPS120, RPS60, RPS20, RPS10（若有）, RPS5, turnover_rate（若有）
+        按规范化后的 code, date 合并，缺失值为 NaN
     """
+    base_dir = base_dir or DEFAULT_EXTDATA_DIR
     rps_dict = load_all_stock_rps(base_dir, scale_0_100)
     if not rps_dict:
         return pd.DataFrame()
@@ -239,7 +319,9 @@ def load_all_stock_rps_merged(base_dir=None, scale_0_100=True):
     for key in order:
         if key not in rps_dict:
             continue
-        parts.append(rps_dict[key][["code", "date", key]].copy())
+        chunk = _normalize_rps_chunk_for_merge(rps_dict[key][["code", "date", key]])
+        if not chunk.empty:
+            parts.append(chunk)
 
     if not parts:
         return pd.DataFrame()
@@ -248,6 +330,13 @@ def load_all_stock_rps_merged(base_dir=None, scale_0_100=True):
     for df in parts[1:]:
         merged = merged.join(df.set_index(["code", "date"]), how="outer")
     merged = merged.reset_index().sort_values(["code", "date"], kind="mergesort").reset_index(drop=True)
+
+    _scale_t = os.environ.get("TDX_EXT11_TURNOVER_DIV10", "").strip().lower() in ("1", "true", "yes")
+    tdf = load_stock_turnover_rate_extdata11(base_dir, scale_like_rps=_scale_t)
+    if tdf is not None and not tdf.empty:
+        tdf = _normalize_rps_chunk_for_merge(tdf)
+        merged = merged.merge(tdf, on=["code", "date"], how="left")
+
     return merged
 
 

@@ -16,6 +16,7 @@ RPS 多周期分析报告（06，自包含）
 OUTPUT_FILENAME = "RPS_多周期分析报告_06.html"
 
 import importlib.util
+import itertools
 import json
 import os
 import re
@@ -24,11 +25,48 @@ import time
 from collections import defaultdict
 from datetime import date, datetime
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.offline import plot
 
 from project_config import load_project_config, get_cfg
+
+from read_tdx_blocks import load_rps_board_codes_from_tdxzs3
+from trading_calendar_service import resolve_sector_constituents_trade_date
+
+from RPS_FINAL_06.block_rps_analysis_service import normalize_board_code_for_db
+from RPS_FINAL_06.sector_constituents_daily_importer import maybe_log_tq_sector_stocks_shape_once
+from RPS_FINAL_06.stock_rps_qfq_merge import (
+    assemble_stock_daily_db_output,
+    attach_merge_qfq_for_stock_daily,
+    list_stock_rps_wide_columns,
+)
+from RPS_FINAL_06.stock_rps_sql_writer import stock_rps_executemany_batch_size
+
+
+def _parse_tdx_export_date_to_int(s: str) -> int | None:
+    """通达信导出日线首列日期 → YYYYMMDD 整数。避免逐行 pd.to_datetime（极慢）。"""
+    s = (s or "").strip()
+    if not s:
+        return None
+    if " " in s:
+        s = s.split()[0].strip()
+    s = s.replace("/", "-")
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        try:
+            y = int(s[0:4])
+            m = int(s[5:7])
+            d = int(s[8:10])
+            if 1990 <= y <= 2100 and 1 <= m <= 12 and 1 <= d <= 31:
+                return y * 10000 + m * 100 + d
+        except Exception:
+            return None
+    if len(s) == 8 and s.isdigit():
+        v = int(s)
+        if 19900000 < v < 21000000:
+            return v
+    return None
 
 
 class 多周期报告配置:
@@ -66,12 +104,25 @@ class 多周期报告配置:
         )
         self.workflow_dir = os.path.join(self.project_root, "workflow")
         self.workspace_root = get_cfg(self._cfg, "paths", "workspace_root", default=r"c:\tool\RPS市场分析系统")
+        self.tdx_hq_cache_dir = str(get_cfg(self._cfg, "paths", "tdx_hq_cache_dir", default="")).strip()
         self.reports_folder = os.path.join(self.workspace_root, "reports")
         self.charts_folder = os.path.join(self.reports_folder, "charts")
         self.cache_dir = os.path.join(self.workspace_root, "cache")
+        self.tdx_day_export_dir = get_cfg(
+            self._cfg,
+            "paths",
+            "tdx_day_export_dir",
+            default=r"C:\tool\Tdx MPV V1.24++\T0002\export\1day",
+        )
+        self.stock_code_name_mapping_csv = get_cfg(
+            self._cfg,
+            "paths",
+            "stock_code_name_mapping_csv",
+            default=os.path.join(self.workspace_root, "stock_code_name_mapping.csv"),
+        )
 
         # 报告参数
-        self.max_days = int(get_cfg(self._cfg, "report", "max_days", default=250))
+        self.max_days = int(get_cfg(self._cfg, "report", "max_days", default=500))
         self.default_days = int(get_cfg(self._cfg, "report", "default_days", default=30))
         self.output_filename = OUTPUT_FILENAME
 
@@ -137,6 +188,30 @@ class 多周期报告配置:
             return False
         return bool(get_cfg(self._cfg, "sqlserver", "sector_stocks_import", default=False))
 
+    def sector_stocks_use_tdxzs3_whitelist(self) -> bool:
+        """
+        成分股入库是否仅保留 tdxzs3.cfg 中出现的板块（hy+gn+yjhy）。
+
+        环境变量 RPS_SECTOR_STOCKS_TDXZS3_WHITELIST：1/true 开、0/false 关；
+        未设置时读 sqlserver.sector_stocks_use_tdxzs3_whitelist，默认 True。
+        """
+        env = os.environ.get("RPS_SECTOR_STOCKS_TDXZS3_WHITELIST", "").strip().lower()
+        if env in ("0", "false", "no", "off"):
+            return False
+        if env in ("1", "true", "yes", "on"):
+            return True
+        return bool(get_cfg(self._cfg, "sqlserver", "sector_stocks_use_tdxzs3_whitelist", default=True))
+
+
+def _sector_code_passes_tdxzs3_whitelist(db_code: str, *, use_whitelist: bool, whitelist: set[str]) -> bool:
+    if not db_code:
+        return False
+    if not use_whitelist:
+        return True
+    if whitelist:
+        return db_code in whitelist
+    return db_code.startswith("880") or db_code.startswith("881")
+
 
 class 板块Rps分析服务:
     """
@@ -164,6 +239,7 @@ class 板块Rps分析服务:
         self.cfg = config
         # code 规范化结果缓存：同一个 code 在一次构建流程中只计算一次
         self._norm_cache = {}
+        self._stock_mapping_cache = None
 
     def _workspace_tdx_ext_module(self):
         """从工作区根目录加载 Tdx_ext_data_reader.py，避免 sys.path 上同名旧文件抢先。"""
@@ -207,13 +283,7 @@ class 板块Rps分析服务:
         if cached is not None:
             return cached
 
-        s = key.strip()
-        if not s:
-            self._norm_cache[key] = ""
-            return ""
-        if len(s) > 6:
-            s = s[:6]
-        norm = s.zfill(6)
+        norm = normalize_board_code_for_db(code)
         self._norm_cache[key] = norm
         return norm
 
@@ -685,7 +755,7 @@ class 板块Rps分析服务:
         out = pd.DataFrame(
             {
                 "trade_date": pd.to_datetime(work["日期"]).dt.date,
-                "board_code": work["代码"].astype(str),
+                "board_code": work["代码"].map(normalize_board_code_for_db),
                 "board_name": work["名称"].astype(str),
                 "board_group": work["板块大类"].astype(str),
                 "board_type": work["类型"].astype(str),
@@ -737,70 +807,192 @@ class 板块Rps分析服务:
             out[c] = nm if nm else c
         return out
 
-    def build_stock_daily_db_frame(self) -> pd.DataFrame:
-        """读取 extdata_5~8 个股 RPS 合并宽表，对齐个股日表字段。"""
-        mod = self._workspace_tdx_ext_module()
-        ext_dir = getattr(mod, "DEFAULT_EXTDATA_DIR", None)
-        merged = mod.load_all_stock_rps_merged(base_dir=ext_dir, scale_0_100=True)
-        if merged is None or merged.empty:
+    def _normalize_stock_code6(self, code: str) -> str:
+        s = "" if code is None else str(code).strip().upper()
+        if not s:
+            return ""
+        if len(s) > 6 and s[-6:].isdigit():
+            return s[-6:]
+        if s.isdigit():
+            return s.zfill(6)
+        return ""
+
+    def load_stock_code_name_mapping(self) -> dict:
+        """读取 stock_code_name_mapping.csv，返回 6 位 code -> 中文名。"""
+        if self._stock_mapping_cache is not None:
+            return self._stock_mapping_cache
+
+        path = self.cfg.stock_code_name_mapping_csv
+        out = {}
+        if not os.path.isfile(path):
+            self._stock_mapping_cache = out
+            return out
+        df = None
+        last_err = None
+        for enc in ("utf-8-sig", "utf-8", "gbk"):
+            try:
+                df = pd.read_csv(path, encoding=enc)
+                break
+            except Exception as e:
+                last_err = e
+        if df is None:
+            print(f"[QFQ] 读取映射失败: {last_err}")
+            self._stock_mapping_cache = out
+            return out
+
+        if {"stock_code", "stock_name"}.issubset(df.columns):
+            for _, r in df.iterrows():
+                c6 = self._normalize_stock_code6(r.get("stock_code"))
+                if not c6:
+                    continue
+                nm = str(r.get("stock_name")).strip() if pd.notna(r.get("stock_name")) else ""
+                if nm:
+                    out[c6] = nm
+        self._stock_mapping_cache = out
+        return out
+
+    def load_qfq_daily_metrics(self, target_codes: set[str], target_dates: set[int]) -> pd.DataFrame:
+        """
+        从前复权导出目录提取个股日线指标（按目标 code/date 裁剪）。
+
+        返回列：
+        - code6: 6 位代码
+        - date: YYYYMMDD 整数
+        - stock_name_qfq: 名称（优先 mapping）
+        - pct_chg: 涨幅（%）
+        """
+        src = self.cfg.tdx_day_export_dir
+        if not os.path.isdir(src) or not target_codes or not target_dates:
             return pd.DataFrame()
 
-        rps_cols = [c for c in ("RPS120", "RPS60", "RPS20", "RPS10", "RPS5") if c in merged.columns]
-        if not rps_cols:
-            return pd.DataFrame()
-
-        work = merged.copy()
-        work["_c"] = work["code"].apply(self.normalize_code)
-        work = work[work["_c"] != ""]
-        all_dates = sorted(work["date"].unique())[-self.cfg.max_days :]
-        work = work[work["date"].isin(all_dates)]
-
-        name_map = self.load_stock_name_map()
-        col_to_db = {
-            "RPS5": "rps5",
-            "RPS10": "rps10",
-            "RPS20": "rps20",
-            "RPS60": "rps60",
-            "RPS120": "rps120",
-        }
-
+        pat = re.compile(r"^(BJ|SH|SZ)#(\d{6})", re.IGNORECASE)
+        mapping = self.load_stock_code_name_mapping()
         rows = []
-        for _, row in work.iterrows():
-            c = row["_c"]
-            d = int(row["date"]) if pd.notna(row["date"]) else None
-            if d is None:
+        t0 = time.perf_counter()
+        processed = 0
+        td = target_dates
+
+        for fn in os.listdir(src):
+            m = pat.match(fn)
+            if not m:
                 continue
-            trade_date = datetime.strptime(str(d), "%Y%m%d").date()
-            item = {
-                "trade_date": trade_date,
-                "stock_code": c,
-                "stock_name": name_map.get(c, c),
-                "rps5": None,
-                "rps10": None,
-                "rps20": None,
-                "rps60": None,
-                "rps120": None,
-            }
-            for col in rps_cols:
-                v = row[col] if col in row.index else None
-                dbk = col_to_db.get(col)
-                if dbk:
-                    item[dbk] = None if pd.isna(v) else round(float(v), 1)
-            if any(
-                item.get(x) is not None
-                for x in ("rps5", "rps10", "rps20", "rps60", "rps120")
-            ):
-                rows.append(item)
+            code6 = m.group(2)
+            if code6 not in target_codes:
+                continue
+            fp = os.path.join(src, fn)
+            try:
+                with open(fp, "r", encoding="gbk", errors="ignore") as f:
+                    lines = [x.strip() for x in f if x.strip()]
+            except Exception:
+                continue
+            if len(lines) < 3:
+                continue
+
+            first_parts = lines[0].split()
+            fallback_name = first_parts[1].strip() if len(first_parts) >= 2 else code6
+            stock_name = mapping.get(code6, fallback_name)
+
+            d_ints: list[int] = []
+            closes: list[float] = []
+            for raw in lines[2:]:
+                parts = [x.strip() for x in raw.split(",")]
+                if len(parts) < 5:
+                    continue
+                di = _parse_tdx_export_date_to_int(parts[0])
+                if di is None:
+                    continue
+                try:
+                    close = float(parts[4])
+                except Exception:
+                    continue
+                d_ints.append(di)
+                closes.append(close)
+
+            if not d_ints:
+                continue
+
+            d_arr = np.asarray(d_ints, dtype=np.int64)
+            c_arr = np.asarray(closes, dtype=np.float64)
+            prev = np.empty_like(c_arr)
+            prev[0] = np.nan
+            prev[1:] = c_arr[:-1]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                pct = np.where((prev == 0) | np.isnan(prev), 0.0, (c_arr - prev) / prev * 100.0)
+
+            for i in range(len(d_arr)):
+                d_int = int(d_arr[i])
+                if d_int not in td:
+                    continue
+                rows.append(
+                    {
+                        "code6": code6,
+                        "date": d_int,
+                        "stock_name_qfq": stock_name,
+                        "pct_chg": round(float(pct[i]), 2),
+                    }
+                )
+
+            processed += 1
+            if processed % 200 == 0:
+                print(
+                    f"[QFQ] 已处理前复权文件 {processed} 个，"
+                    f"累计行 {len(rows)}，用时 {time.perf_counter() - t0:.1f}s …"
+                )
+
+        if processed:
+            print(
+                f"[QFQ] 前复权完成：文件 {processed} 个，输出行 {len(rows)}，"
+                f"用时 {time.perf_counter() - t0:.1f}s"
+            )
 
         if not rows:
             return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df = df.sort_values(["code6", "date"]).drop_duplicates(subset=["code6", "date"], keep="last")
+        return df
 
-        out = pd.DataFrame(rows)
-        for x in ("rps5", "rps10", "rps20", "rps60", "rps120"):
-            if x in out.columns:
-                out[x] = pd.to_numeric(out[x], errors="coerce")
+    def build_stock_daily_db_frame(self) -> pd.DataFrame:
+        """读取 extdata 个股 RPS（含 extdata_11 换手率），与前复权 OHLCV 合并后，再组装入库 DataFrame。"""
+        mod = self._workspace_tdx_ext_module()
+        ext_dir = getattr(mod, "DEFAULT_EXTDATA_DIR", None)
+        t_m = time.perf_counter()
+        merged = mod.load_all_stock_rps_merged(base_dir=ext_dir, scale_0_100=True)
+        print(
+            f"[STOCK-DB] load_all_stock_rps_merged: {time.perf_counter() - t_m:.1f}s, 行数={0 if merged is None else len(merged)}"
+        )
+        if merged is None or merged.empty:
+            return pd.DataFrame()
 
-        out = out.drop_duplicates(subset=["trade_date", "stock_code"], keep="last")
+        rps_cols = list_stock_rps_wide_columns(merged)
+        if not rps_cols:
+            return pd.DataFrame()
+
+        t_pipe = time.perf_counter()
+        work = attach_merge_qfq_for_stock_daily(
+            merged,
+            normalize_code_fn=self.normalize_code,
+            max_days=self.cfg.max_days,
+            export_dir=self.cfg.tdx_day_export_dir,
+            code_to_name=self.load_stock_code_name_mapping(),
+        )
+        print(
+            f"[STOCK-DB] rps+换手率+前复权 合并: {time.perf_counter() - t_pipe:.1f}s, "
+            f"股票数={work['_c'].nunique() if not work.empty else 0}, 行数={len(work)}"
+        )
+        if work.empty:
+            return pd.DataFrame()
+
+        name_map = self.load_stock_name_map()
+        mapping_name_map = self.load_stock_code_name_mapping()
+
+        t_asm = time.perf_counter()
+        out = assemble_stock_daily_db_output(
+            work,
+            rps_cols,
+            mapping_name_map=mapping_name_map,
+            name_map=name_map,
+        )
+        print(f"[STOCK-DB] assemble output: {time.perf_counter() - t_asm:.1f}s, 行数={len(out)}")
         return out
 
 
@@ -928,59 +1120,72 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             conn.commit()
         return len(rows)
 
-
-class 个股Rps数据库写入:
-    """个股日频 RPS 写入 SQL Server（extdata_5~8）。"""
-
-    def __init__(self, cfg: 多周期报告配置):
-        self.cfg = cfg
-        self.driver = 板块Rps数据库写入._detect_odbc_driver()
-        self.table_name = cfg.sqlserver_stock_table
-        self.conn_str = (
-            f"DRIVER={{{self.driver}}};"
-            f"SERVER={cfg.sqlserver_host};"
-            f"DATABASE={cfg.sqlserver_db};"
-            f"UID={cfg.sqlserver_user};"
-            f"PWD={cfg.sqlserver_password};"
-            "Encrypt=No;"
-            "TrustServerCertificate=Yes;"
-        )
-
-    def write_stock_daily_rps(self, df: pd.DataFrame) -> int:
+    def write_daily_rps_incremental(self, df: pd.DataFrame) -> int:
+        """板块 RPS 增量入库：仅插入不存在的 (trade_date, board_code)。"""
         if df is None or df.empty:
+            print("[INC][板块] 输入为空，跳过。")
             return 0
 
         import math
         import pyodbc
 
-        tn = self.table_name
         create_sql = f"""
-IF OBJECT_ID(N'dbo.{tn}', N'U') IS NULL
+IF OBJECT_ID(N'dbo.{self.table_name}', N'U') IS NULL
 BEGIN
-    CREATE TABLE dbo.{tn} (
+    CREATE TABLE dbo.{self.table_name} (
         id BIGINT IDENTITY(1,1) PRIMARY KEY,
         trade_date DATE NOT NULL,
-        stock_code NVARCHAR(16) NOT NULL,
-        stock_name NVARCHAR(64) NULL,
+        board_code NVARCHAR(16) NOT NULL,
+        board_name NVARCHAR(128) NOT NULL,
+        board_group NVARCHAR(16) NOT NULL,
+        board_type NVARCHAR(32) NULL,
         rps5 FLOAT NULL,
+        rps10 FLOAT NULL,
         rps20 FLOAT NULL,
         rps60 FLOAT NULL,
         rps120 FLOAT NULL,
+        rps250 FLOAT NULL,
         created_at DATETIME NOT NULL DEFAULT(GETDATE())
     );
-    CREATE INDEX IX_{tn}_date_code ON dbo.{tn}(trade_date, stock_code);
+    CREATE INDEX IX_{self.table_name}_date_code ON dbo.{self.table_name}(trade_date, board_code);
 END
 """
-
-        delete_sql = f"DELETE FROM dbo.{tn} WHERE trade_date >= ? AND trade_date <= ?"
-        insert_sql = f"""
-INSERT INTO dbo.{tn}
-(trade_date, stock_code, stock_name, rps5, rps20, rps60, rps120, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        create_tmp_sql = """
+IF OBJECT_ID('tempdb..#tmp_board_rps_inc') IS NOT NULL DROP TABLE #tmp_board_rps_inc;
+CREATE TABLE #tmp_board_rps_inc (
+    trade_date DATE NOT NULL,
+    board_code NVARCHAR(16) NOT NULL,
+    board_name NVARCHAR(128) NOT NULL,
+    board_group NVARCHAR(16) NOT NULL,
+    board_type NVARCHAR(32) NULL,
+    rps5 FLOAT NULL,
+    rps10 FLOAT NULL,
+    rps20 FLOAT NULL,
+    rps60 FLOAT NULL,
+    rps120 FLOAT NULL,
+    rps250 FLOAT NULL,
+    created_at DATETIME NOT NULL
+);
 """
-
-        min_d = df["trade_date"].min()
-        max_d = df["trade_date"].max()
+        insert_tmp_sql = """
+INSERT INTO #tmp_board_rps_inc
+(trade_date, board_code, board_name, board_group, board_type, rps5, rps10, rps20, rps60, rps120, rps250, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+        insert_new_sql = f"""
+INSERT INTO dbo.{self.table_name}
+(trade_date, board_code, board_name, board_group, board_type, rps5, rps10, rps20, rps60, rps120, rps250, created_at)
+SELECT
+    s.trade_date, s.board_code, s.board_name, s.board_group, s.board_type,
+    s.rps5, s.rps10, s.rps20, s.rps60, s.rps120, s.rps250, s.created_at
+FROM #tmp_board_rps_inc s
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM dbo.{self.table_name} t
+    WHERE t.trade_date = s.trade_date
+      AND t.board_code = s.board_code
+);
+"""
 
         def _safe_num(v):
             if v is None:
@@ -1001,24 +1206,481 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             rows.append(
                 (
                     r["trade_date"],
-                    r["stock_code"],
-                    r["stock_name"] if pd.notna(r.get("stock_name")) else None,
+                    r["board_code"],
+                    r["board_name"],
+                    r["board_group"],
+                    r["board_type"],
                     _safe_num(r["rps5"]),
+                    _safe_num(r["rps10"]),
                     _safe_num(r["rps20"]),
                     _safe_num(r["rps60"]),
                     _safe_num(r["rps120"]),
+                    _safe_num(r["rps250"]),
                     now_ts,
                 )
             )
 
+        inserted = 0
+        with pyodbc.connect(self.conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute(create_sql)
+            cursor.execute(create_tmp_sql)
+            cursor.fast_executemany = True
+            cursor.executemany(insert_tmp_sql, rows)
+            cursor.execute(insert_new_sql)
+            rc = cursor.rowcount
+            inserted = int(rc) if rc is not None and rc >= 0 else 0
+            conn.commit()
+        print(f"[INC][板块] 候选 {len(rows)} 条，新增 {inserted} 条。")
+        return inserted
+
+    def _table_sql_ident(self) -> str:
+        t = str(self.table_name or "").strip() or "board_rps_daily"
+        return f"[{t}]"
+
+    def fetch_latest_trade_date(self) -> date | None:
+        """板块 RPS 表中 MAX(trade_date)；无数据时为 None。"""
+        import pyodbc
+
+        sql = f"SELECT CAST(MAX(trade_date) AS DATE) AS mx FROM dbo.{self._table_sql_ident()}"
+        with pyodbc.connect(self.conn_str) as conn:
+            cur = conn.cursor()
+            cur.execute(sql)
+            row = cur.fetchone()
+            if not row or row[0] is None:
+                return None
+            v = row[0]
+            if isinstance(v, datetime):
+                return v.date()
+            if isinstance(v, date):
+                return v
+            return datetime.strptime(str(v)[:10], "%Y-%m-%d").date()
+
+    def fetch_trade_dates_in_range(self, dmin: date, dmax: date) -> set[date]:
+        """闭区间内已存在至少一行板块 RPS 的 trade_date 集合。"""
+        import pyodbc
+
+        sql = (
+            f"SELECT CAST(trade_date AS DATE) AS d FROM dbo.{self._table_sql_ident()} "
+            "WHERE trade_date >= ? AND trade_date <= ? GROUP BY trade_date"
+        )
+        out: set[date] = set()
+        with pyodbc.connect(self.conn_str) as conn:
+            cur = conn.cursor()
+            cur.execute(sql, dmin, dmax)
+            for row in cur.fetchall():
+                if not row or row[0] is None:
+                    continue
+                v = row[0]
+                if isinstance(v, datetime):
+                    out.add(v.date())
+                elif isinstance(v, date):
+                    out.add(v)
+                else:
+                    out.add(datetime.strptime(str(v)[:10], "%Y-%m-%d").date())
+        return out
+
+
+class 个股Rps数据库写入:
+    """个股日频写入 SQL Server：RPS、换手率、前复权 OHLCV/量额/涨幅合并后落库（stock_rps_daily）。"""
+
+    def __init__(self, cfg: 多周期报告配置):
+        self.cfg = cfg
+        self.driver = 板块Rps数据库写入._detect_odbc_driver()
+        self.table_name = cfg.sqlserver_stock_table
+        self.conn_str = (
+            f"DRIVER={{{self.driver}}};"
+            f"SERVER={cfg.sqlserver_host};"
+            f"DATABASE={cfg.sqlserver_db};"
+            f"UID={cfg.sqlserver_user};"
+            f"PWD={cfg.sqlserver_password};"
+            "Encrypt=No;"
+            "TrustServerCertificate=Yes;"
+        )
+
+    def write_stock_daily_rps(self, df: pd.DataFrame) -> int:
+        if df is None or df.empty:
+            return 0
+
+        import pyodbc
+
+        tn = self.table_name
+        create_sql = f"""
+IF OBJECT_ID(N'dbo.{tn}', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.{tn} (
+        id BIGINT IDENTITY(1,1) PRIMARY KEY,
+        trade_date DATE NOT NULL,
+        stock_code NVARCHAR(16) NOT NULL,
+        stock_name NVARCHAR(64) NULL,
+        rps5 FLOAT NULL,
+        rps10 FLOAT NULL,
+        rps20 FLOAT NULL,
+        rps60 FLOAT NULL,
+        rps120 FLOAT NULL,
+        pct_chg FLOAT NULL,
+        turnover_rate FLOAT NULL,
+        qfq_open FLOAT NULL,
+        qfq_high FLOAT NULL,
+        qfq_low FLOAT NULL,
+        qfq_close FLOAT NULL,
+        volume FLOAT NULL,
+        amount FLOAT NULL,
+        created_at DATETIME NOT NULL DEFAULT(GETDATE())
+    );
+    CREATE INDEX IX_{tn}_date_code ON dbo.{tn}(trade_date, stock_code);
+END
+IF COL_LENGTH(N'dbo.{tn}', N'rps10') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD rps10 FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'pct_chg') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD pct_chg FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'turnover_rate') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD turnover_rate FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'qfq_open') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD qfq_open FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'qfq_high') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD qfq_high FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'qfq_low') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD qfq_low FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'qfq_close') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD qfq_close FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'volume') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD volume FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'amount') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD amount FLOAT NULL;
+END
+"""
+
+        delete_sql = f"DELETE FROM dbo.{tn} WHERE trade_date >= ? AND trade_date <= ?"
+        insert_sql = f"""
+INSERT INTO dbo.{tn}
+(trade_date, stock_code, stock_name, rps5, rps10, rps20, rps60, rps120, pct_chg, turnover_rate,
+ qfq_open, qfq_high, qfq_low, qfq_close, volume, amount, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+        min_d = df["trade_date"].min()
+        max_d = df["trade_date"].max()
+
+        def _nullable_float_col(series: pd.Series) -> np.ndarray:
+            """转为 object 数组：非有限值 -> None，供 pyodbc 写 NULL。"""
+            x = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64)
+            out = np.empty(len(x), dtype=object)
+            m = np.isfinite(x)
+            out[~m] = None
+            out[m] = x[m]
+            return out
+
+        def _nullable_name_col(series: pd.Series) -> list:
+            if series is None or len(series) == 0:
+                return []
+            out = []
+            for v in series.values:
+                if v is None or (isinstance(v, float) and np.isnan(v)):
+                    out.append(None)
+                elif pd.isna(v):
+                    out.append(None)
+                else:
+                    s = str(v).strip()
+                    out.append(s if s else None)
+            return out
+
+        t_rows = time.perf_counter()
+        n = len(df)
+        td_col = df["trade_date"]
+        if pd.api.types.is_datetime64_any_dtype(td_col):
+            trade_dates = list(td_col.dt.date)
+        else:
+            trade_dates = td_col.tolist()
+
+        sc_col = df["stock_code"].astype(str).str.strip()
+        stock_codes = sc_col.tolist()
+
+        if "stock_name" in df.columns:
+            names = _nullable_name_col(df["stock_name"])
+        else:
+            names = [None] * n
+
+        r5 = _nullable_float_col(df["rps5"]) if "rps5" in df.columns else np.full(n, None, dtype=object)
+        r10 = _nullable_float_col(df["rps10"]) if "rps10" in df.columns else np.full(n, None, dtype=object)
+        r20 = _nullable_float_col(df["rps20"]) if "rps20" in df.columns else np.full(n, None, dtype=object)
+        r60 = _nullable_float_col(df["rps60"]) if "rps60" in df.columns else np.full(n, None, dtype=object)
+        r120 = _nullable_float_col(df["rps120"]) if "rps120" in df.columns else np.full(n, None, dtype=object)
+        pct = _nullable_float_col(df["pct_chg"]) if "pct_chg" in df.columns else np.full(n, None, dtype=object)
+        turn = _nullable_float_col(df["turnover_rate"]) if "turnover_rate" in df.columns else np.full(n, None, dtype=object)
+        qo = _nullable_float_col(df["qfq_open"]) if "qfq_open" in df.columns else np.full(n, None, dtype=object)
+        qh = _nullable_float_col(df["qfq_high"]) if "qfq_high" in df.columns else np.full(n, None, dtype=object)
+        ql = _nullable_float_col(df["qfq_low"]) if "qfq_low" in df.columns else np.full(n, None, dtype=object)
+        qc = _nullable_float_col(df["qfq_close"]) if "qfq_close" in df.columns else np.full(n, None, dtype=object)
+        vol = _nullable_float_col(df["volume"]) if "volume" in df.columns else np.full(n, None, dtype=object)
+        amt = _nullable_float_col(df["amount"]) if "amount" in df.columns else np.full(n, None, dtype=object)
+
+        now_ts = datetime.now()
+        print(f"[DB] 个股列向量化准备: {time.perf_counter() - t_rows:.2f}s, {n} 行（分批 zip，不一次性物化全表）")
+
+        batch_size = stock_rps_executemany_batch_size()
+        t_db = time.perf_counter()
         with pyodbc.connect(self.conn_str) as conn:
             cursor = conn.cursor()
             cursor.execute(create_sql)
             cursor.execute(delete_sql, min_d, max_d)
             cursor.fast_executemany = True
-            cursor.executemany(insert_sql, rows)
+            for start in range(0, n, batch_size):
+                end = min(start + batch_size, n)
+                chunk = list(
+                    zip(
+                        trade_dates[start:end],
+                        stock_codes[start:end],
+                        names[start:end],
+                        r5[start:end],
+                        r10[start:end],
+                        r20[start:end],
+                        r60[start:end],
+                        r120[start:end],
+                        pct[start:end],
+                        turn[start:end],
+                        qo[start:end],
+                        qh[start:end],
+                        ql[start:end],
+                        qc[start:end],
+                        vol[start:end],
+                        amt[start:end],
+                        itertools.repeat(now_ts, end - start),
+                    )
+                )
+                cursor.executemany(insert_sql, chunk)
             conn.commit()
-        return len(rows)
+        print(f"[DB] 个股 executemany({batch_size}/批): {time.perf_counter() - t_db:.2f}s")
+        return n
+
+    def write_stock_daily_rps_incremental(self, df: pd.DataFrame) -> int:
+        """个股 RPS 增量入库：仅插入不存在的 (trade_date, stock_code)。"""
+        if df is None or df.empty:
+            print("[INC][个股] 输入为空，跳过。")
+            return 0
+
+        import pyodbc
+
+        tn = self.table_name
+        create_sql = f"""
+IF OBJECT_ID(N'dbo.{tn}', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.{tn} (
+        id BIGINT IDENTITY(1,1) PRIMARY KEY,
+        trade_date DATE NOT NULL,
+        stock_code NVARCHAR(16) NOT NULL,
+        stock_name NVARCHAR(64) NULL,
+        rps5 FLOAT NULL,
+        rps10 FLOAT NULL,
+        rps20 FLOAT NULL,
+        rps60 FLOAT NULL,
+        rps120 FLOAT NULL,
+        pct_chg FLOAT NULL,
+        turnover_rate FLOAT NULL,
+        qfq_open FLOAT NULL,
+        qfq_high FLOAT NULL,
+        qfq_low FLOAT NULL,
+        qfq_close FLOAT NULL,
+        volume FLOAT NULL,
+        amount FLOAT NULL,
+        created_at DATETIME NOT NULL DEFAULT(GETDATE())
+    );
+    CREATE INDEX IX_{tn}_date_code ON dbo.{tn}(trade_date, stock_code);
+END
+IF COL_LENGTH(N'dbo.{tn}', N'rps10') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD rps10 FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'pct_chg') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD pct_chg FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'turnover_rate') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD turnover_rate FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'qfq_open') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD qfq_open FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'qfq_high') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD qfq_high FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'qfq_low') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD qfq_low FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'qfq_close') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD qfq_close FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'volume') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD volume FLOAT NULL;
+END
+IF COL_LENGTH(N'dbo.{tn}', N'amount') IS NULL
+BEGIN
+    ALTER TABLE dbo.{tn} ADD amount FLOAT NULL;
+END
+"""
+        create_tmp_sql = """
+IF OBJECT_ID('tempdb..#tmp_stock_rps_inc') IS NOT NULL DROP TABLE #tmp_stock_rps_inc;
+CREATE TABLE #tmp_stock_rps_inc (
+    trade_date DATE NOT NULL,
+    stock_code NVARCHAR(16) NOT NULL,
+    stock_name NVARCHAR(64) NULL,
+    rps5 FLOAT NULL,
+    rps10 FLOAT NULL,
+    rps20 FLOAT NULL,
+    rps60 FLOAT NULL,
+    rps120 FLOAT NULL,
+    pct_chg FLOAT NULL,
+    turnover_rate FLOAT NULL,
+    qfq_open FLOAT NULL,
+    qfq_high FLOAT NULL,
+    qfq_low FLOAT NULL,
+    qfq_close FLOAT NULL,
+    volume FLOAT NULL,
+    amount FLOAT NULL,
+    created_at DATETIME NOT NULL
+);
+"""
+        insert_tmp_sql = """
+INSERT INTO #tmp_stock_rps_inc
+(trade_date, stock_code, stock_name, rps5, rps10, rps20, rps60, rps120, pct_chg, turnover_rate,
+ qfq_open, qfq_high, qfq_low, qfq_close, volume, amount, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+        insert_new_sql = f"""
+INSERT INTO dbo.{tn}
+(trade_date, stock_code, stock_name, rps5, rps10, rps20, rps60, rps120, pct_chg, turnover_rate,
+ qfq_open, qfq_high, qfq_low, qfq_close, volume, amount, created_at)
+SELECT
+    s.trade_date, s.stock_code, s.stock_name, s.rps5, s.rps10, s.rps20, s.rps60, s.rps120, s.pct_chg, s.turnover_rate,
+    s.qfq_open, s.qfq_high, s.qfq_low, s.qfq_close, s.volume, s.amount, s.created_at
+FROM #tmp_stock_rps_inc s
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM dbo.{tn} t
+    WHERE t.trade_date = s.trade_date
+      AND t.stock_code = s.stock_code
+);
+"""
+
+        def _nullable_float_col(series: pd.Series) -> np.ndarray:
+            """转为 object 数组：非有限值 -> None，供 pyodbc 写 NULL。"""
+            x = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64)
+            out = np.empty(len(x), dtype=object)
+            m = np.isfinite(x)
+            out[~m] = None
+            out[m] = x[m]
+            return out
+
+        def _nullable_name_col(series: pd.Series) -> list:
+            if series is None or len(series) == 0:
+                return []
+            out = []
+            for v in series.values:
+                if v is None or (isinstance(v, float) and np.isnan(v)):
+                    out.append(None)
+                elif pd.isna(v):
+                    out.append(None)
+                else:
+                    s = str(v).strip()
+                    out.append(s if s else None)
+            return out
+
+        t_rows = time.perf_counter()
+        n = len(df)
+        td_col = df["trade_date"]
+        if pd.api.types.is_datetime64_any_dtype(td_col):
+            trade_dates = list(td_col.dt.date)
+        else:
+            trade_dates = td_col.tolist()
+
+        sc_col = df["stock_code"].astype(str).str.strip()
+        stock_codes = sc_col.tolist()
+
+        if "stock_name" in df.columns:
+            names = _nullable_name_col(df["stock_name"])
+        else:
+            names = [None] * n
+
+        r5 = _nullable_float_col(df["rps5"]) if "rps5" in df.columns else np.full(n, None, dtype=object)
+        r10 = _nullable_float_col(df["rps10"]) if "rps10" in df.columns else np.full(n, None, dtype=object)
+        r20 = _nullable_float_col(df["rps20"]) if "rps20" in df.columns else np.full(n, None, dtype=object)
+        r60 = _nullable_float_col(df["rps60"]) if "rps60" in df.columns else np.full(n, None, dtype=object)
+        r120 = _nullable_float_col(df["rps120"]) if "rps120" in df.columns else np.full(n, None, dtype=object)
+        pct = _nullable_float_col(df["pct_chg"]) if "pct_chg" in df.columns else np.full(n, None, dtype=object)
+        turn = (
+            _nullable_float_col(df["turnover_rate"]) if "turnover_rate" in df.columns else np.full(n, None, dtype=object)
+        )
+        qo = _nullable_float_col(df["qfq_open"]) if "qfq_open" in df.columns else np.full(n, None, dtype=object)
+        qh = _nullable_float_col(df["qfq_high"]) if "qfq_high" in df.columns else np.full(n, None, dtype=object)
+        ql = _nullable_float_col(df["qfq_low"]) if "qfq_low" in df.columns else np.full(n, None, dtype=object)
+        qc = _nullable_float_col(df["qfq_close"]) if "qfq_close" in df.columns else np.full(n, None, dtype=object)
+        vol = _nullable_float_col(df["volume"]) if "volume" in df.columns else np.full(n, None, dtype=object)
+        amt = _nullable_float_col(df["amount"]) if "amount" in df.columns else np.full(n, None, dtype=object)
+
+        now_ts = datetime.now()
+        print(f"[INC][个股] 列向量化准备: {time.perf_counter() - t_rows:.2f}s, 候选 {n} 条（分批写入临时表）")
+
+        batch_size = stock_rps_executemany_batch_size()
+        inserted = 0
+        t_db = time.perf_counter()
+        with pyodbc.connect(self.conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute(create_sql)
+            cursor.execute(create_tmp_sql)
+            cursor.fast_executemany = True
+            for start in range(0, n, batch_size):
+                end = min(start + batch_size, n)
+                chunk = list(
+                    zip(
+                        trade_dates[start:end],
+                        stock_codes[start:end],
+                        names[start:end],
+                        r5[start:end],
+                        r10[start:end],
+                        r20[start:end],
+                        r60[start:end],
+                        r120[start:end],
+                        pct[start:end],
+                        turn[start:end],
+                        qo[start:end],
+                        qh[start:end],
+                        ql[start:end],
+                        qc[start:end],
+                        vol[start:end],
+                        amt[start:end],
+                        itertools.repeat(now_ts, end - start),
+                    )
+                )
+                cursor.executemany(insert_tmp_sql, chunk)
+            cursor.execute(insert_new_sql)
+            rc = cursor.rowcount
+            inserted = int(rc) if rc is not None and rc >= 0 else 0
+            conn.commit()
+        print(f"[INC][个股] 批量写入临时表({batch_size}/批)+增量入库: {time.perf_counter() - t_db:.2f}s, 新增 {inserted} 条")
+        return inserted
 
 
 class 板块成分股每日入库服务:
@@ -1051,10 +1713,14 @@ class 板块成分股每日入库服务:
 
         返回：
             (是否整体成功, 写入行数)；tq 不可用时返回 (False, 0)，不抛异常以便报告流程继续。
+
+        说明：
+            ``sector_stocks_daily.trade_date`` 存 A 股交易日（期望最近交易日），不是执行脚本的系统日历日。
         """
         import pyodbc
 
-        trade_date = date.today()
+        trade_date, td_note = resolve_sector_constituents_trade_date(None)
+        print(f"[成分股] sector_stocks_daily.trade_date={trade_date.isoformat()} ({td_note})")
         tq = None
         try:
             from tqcenter import tq as tq_mod
@@ -1100,6 +1766,16 @@ class 板块成分股每日入库服务:
                         codes = []
                     sectors = [{"code": c, "name": c} for c in (codes or [])]
 
+                use_wl = self.cfg.sector_stocks_use_tdxzs3_whitelist()
+                wl: set[str] = set()
+                if use_wl:
+                    hq = (self.cfg.tdx_hq_cache_dir or "").strip()
+                    wl = load_rps_board_codes_from_tdxzs3(hq if hq else None)
+                    print(
+                        f"[成分股] tdxzs3 白名单 {len(wl)} 个板块码（hy+gn+yjhy）；"
+                        f"为 0 时退化为仅 880/881 前缀。关闭过滤：sector_stocks_use_tdxzs3_whitelist=false"
+                    )
+
                 rows = []
                 total_sectors = len(sectors)
                 for i, sector in enumerate(sectors, 1):
@@ -1107,6 +1783,11 @@ class 板块成分股每日入库服务:
                     if sector_code is None and isinstance(sector, dict):
                         sector_code = sector.get("block")
                     if not sector_code:
+                        continue
+                    sector_code_db = normalize_board_code_for_db(sector_code)
+                    if not sector_code_db or not _sector_code_passes_tdxzs3_whitelist(
+                        sector_code_db, use_whitelist=use_wl, whitelist=wl
+                    ):
                         continue
                     sector_name = (sector.get("name") if isinstance(sector, dict) else None) or sector_code
                     try:
@@ -1117,10 +1798,11 @@ class 板块成分股每日入库服务:
                     if not stocks:
                         time.sleep(0.05)
                         continue
+                    maybe_log_tq_sector_stocks_shape_once(sector_code, stocks)
                     for stock_code in stocks:
-                        sc = str(stock_code).strip()
-                        if sc:
-                            rows.append((trade_date, str(sector_code).strip(), str(sector_name).strip(), sc))
+                        sc_db = normalize_board_code_for_db(stock_code)
+                        if sc_db:
+                            rows.append((trade_date, sector_code_db, str(sector_name).strip(), sc_db))
                     time.sleep(0.1)
             finally:
                 tq.initialize = _orig_init
@@ -1166,6 +1848,171 @@ VALUES (?, ?, ?, ?)
             return True, len(rows)
         except Exception as e:
             print(f"[成分股] 入库失败: {e}")
+            return False, 0
+        finally:
+            if tq is not None:
+                try:
+                    tq.close()
+                except Exception:
+                    pass
+
+    def run_incremental(self, target_trade_date: date | None = None) -> tuple[bool, int]:
+        """
+        执行当日全板块成分股增量入库（不删除旧数据，仅插入缺失键）。
+
+        返回：
+            (是否整体成功, 实际新增行数)；tq 不可用时返回 (False, 0)，不抛异常以便外层流程继续。
+        """
+        import pyodbc
+
+        trade_date, td_note = resolve_sector_constituents_trade_date(target_trade_date)
+        print(f"[INC][成分股] sector_stocks_daily.trade_date={trade_date.isoformat()} ({td_note})")
+        tq = None
+        try:
+            from tqcenter import tq as tq_mod
+        except ImportError as e:
+            print(f"[INC][成分股] 无法导入 tqcenter: {e}，跳过板块成分股入库。")
+            return False, 0
+
+        tq = tq_mod
+        try:
+            tq.initialize(os.path.abspath(__file__))
+        except Exception as e:
+            print(f"[INC][成分股] 通达信 tq.initialize 失败: {e}（请确认客户端已登录），跳过。")
+            try:
+                tq.close()
+            except Exception:
+                pass
+            return False, 0
+
+        _orig_init = tq.initialize
+        _orig_close = tq.close
+        _orig_auto_close = getattr(tq, "_auto_close", None)
+        _noop = lambda *a, **k: None
+
+        try:
+            tq.initialize = _noop
+            tq.close = _noop
+            if _orig_auto_close is not None:
+                tq._auto_close = _noop
+            try:
+                try:
+                    sectors = tq.get_sector_list_with_names(fetch_name_by_code=False)
+                except TypeError:
+                    sectors = tq.get_sector_list_with_names()
+                if not sectors:
+                    try:
+                        codes = tq.get_sector_list()
+                    except Exception:
+                        codes = []
+                    sectors = [{"code": c, "name": c} for c in (codes or [])]
+
+                use_wl = self.cfg.sector_stocks_use_tdxzs3_whitelist()
+                wl: set[str] = set()
+                if use_wl:
+                    hq = (self.cfg.tdx_hq_cache_dir or "").strip()
+                    wl = load_rps_board_codes_from_tdxzs3(hq if hq else None)
+                    print(
+                        f"[INC][成分股] tdxzs3 白名单 {len(wl)} 个板块码（hy+gn+yjhy）；"
+                        f"为 0 时退化为仅 880/881 前缀。"
+                    )
+
+                rows = []
+                total_sectors = len(sectors)
+                for i, sector in enumerate(sectors, 1):
+                    sector_code = sector.get("code") if isinstance(sector, dict) else None
+                    if sector_code is None and isinstance(sector, dict):
+                        sector_code = sector.get("block")
+                    if not sector_code:
+                        continue
+                    sector_code_db = normalize_board_code_for_db(sector_code)
+                    if not sector_code_db or not _sector_code_passes_tdxzs3_whitelist(
+                        sector_code_db, use_whitelist=use_wl, whitelist=wl
+                    ):
+                        continue
+                    sector_name = (sector.get("name") if isinstance(sector, dict) else None) or sector_code
+                    try:
+                        stocks = tq.get_stock_list_in_sector(sector_code, block_type=0)
+                    except Exception as e:
+                        print(f"[INC][成分股] [{i}/{total_sectors}] {sector_code} 成分股失败: {e}")
+                        stocks = []
+                    if not stocks:
+                        time.sleep(0.05)
+                        continue
+                    maybe_log_tq_sector_stocks_shape_once(sector_code, stocks)
+                    for stock_code in stocks:
+                        sc_db = normalize_board_code_for_db(stock_code)
+                        if sc_db:
+                            rows.append((trade_date, sector_code_db, str(sector_name).strip(), sc_db))
+                    time.sleep(0.1)
+            finally:
+                tq.initialize = _orig_init
+                tq.close = _orig_close
+                if _orig_auto_close is not None:
+                    tq._auto_close = _orig_auto_close
+
+            if not rows:
+                print("[INC][成分股] 未收集到任何成分股记录。")
+                return True, 0
+
+            tn = self.table_name
+            create_sql = f"""
+IF OBJECT_ID(N'dbo.{tn}', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.{tn} (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        trade_date DATE NOT NULL,
+        sector_code NVARCHAR(50) NOT NULL,
+        sector_name NVARCHAR(200) NULL,
+        stock_code NVARCHAR(20) NOT NULL,
+        stock_name NVARCHAR(100) NULL,
+        created_at DATETIME NOT NULL DEFAULT(GETDATE()),
+        CONSTRAINT UQ_{tn}_sector_daily UNIQUE (trade_date, sector_code, stock_code)
+    );
+END
+"""
+            create_tmp_sql = """
+IF OBJECT_ID('tempdb..#tmp_sector_inc') IS NOT NULL DROP TABLE #tmp_sector_inc;
+CREATE TABLE #tmp_sector_inc (
+    trade_date DATE NOT NULL,
+    sector_code NVARCHAR(50) NOT NULL,
+    sector_name NVARCHAR(200) NULL,
+    stock_code NVARCHAR(20) NOT NULL
+);
+"""
+            insert_tmp_sql = """
+INSERT INTO #tmp_sector_inc (trade_date, sector_code, sector_name, stock_code)
+VALUES (?, ?, ?, ?)
+"""
+            insert_new_sql = f"""
+INSERT INTO dbo.{tn} (trade_date, sector_code, sector_name, stock_code)
+SELECT s.trade_date, s.sector_code, s.sector_name, s.stock_code
+FROM #tmp_sector_inc s
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM dbo.{tn} t
+    WHERE t.trade_date = s.trade_date
+      AND t.sector_code = s.sector_code
+      AND t.stock_code = s.stock_code
+);
+"""
+
+            inserted = 0
+            with pyodbc.connect(self.conn_str) as conn:
+                cur = conn.cursor()
+                cur.execute(create_sql)
+                cur.execute(create_tmp_sql)
+                cur.fast_executemany = True
+                cur.executemany(insert_tmp_sql, rows)
+                cur.execute(insert_new_sql)
+                rc = cur.rowcount
+                inserted = int(rc) if rc is not None and rc >= 0 else 0
+                conn.commit()
+
+            print(f"[INC][成分股] 候选 {len(rows)} 条，新增 {inserted} 条 → {self.cfg.sqlserver_db}.dbo.{tn}")
+            return True, inserted
+        except Exception as e:
+            print(f"[INC][成分股] 入库失败: {e}")
             return False, 0
         finally:
             if tq is not None:
@@ -1319,11 +2166,11 @@ class 多周期Rps报告页面:
     .layout {{ display: flex; gap: 16px; }}
     .board-tabs {{ width: 130px; display: flex; flex-direction: column; gap: 8px; }}
     .board-tab-button {{ padding: 10px 8px; border: 1px solid #d0d7de; background: #f3f4f6; border-radius: 8px; cursor: pointer; font-weight: bold; }}
-    .board-tab-button.active {{ background: #2c3e50; color: #fff; }}
+    .board-tab-button.active {{ background: #d32f2f; color: #fff; }}
     .content-area {{ flex: 1; }}
     .tabs {{ display: flex; gap: 5px; margin-bottom: 20px; border-bottom: 2px solid #d0d7de; padding-bottom: 10px; }}
     .tab-button {{ padding: 8px 20px; font-size: 16px; font-weight: bold; border: none; background: #e9ecef; border-radius: 20px 20px 0 0; cursor: pointer; }}
-    .tab-button.active {{ background: #2c3e50; color: white; }}
+    .tab-button.active {{ background: #d32f2f; color: white; }}
     .tab-pane {{ display: none; }} .tab-pane.active {{ display: block; }}
     .table-wrapper {{ background: white; border-radius: 8px; padding: 15px; border: 1px solid #d0d7de; overflow-x: auto; }}
     table {{ border-collapse: collapse; font-size: 12px; min-width: 100%; }}
@@ -1339,7 +2186,7 @@ class 多周期Rps报告页面:
     .added {{ color: #27ae60; font-weight: bold; }}
     .removed {{ color: #c0392b; font-weight: bold; }}
     .source-dest {{ font-weight: normal; color: #555; }}
-    /* 成分股：悬停时在板块单元格旁半透明浮动层，不遮整页 */
+    /* 成分股浮框：黑底红字；序号 + 代码 + 名称 + 收盘价 + 涨幅 + 换手（最多 20 行，数据来自接口/ stock_rps_daily 联表） */
     #sector-stock-mask {{
       display: none;
       position: fixed;
@@ -1347,79 +2194,124 @@ class 多周期Rps报告页面:
       left: 0;
       top: 0;
       width: max-content;
-      max-width: min(520px, 92vw);
+      max-width: min(560px, 98vw);
       pointer-events: none;
     }}
     #sector-stock-mask.visible {{ display: block; }}
     .sector-stock-mask-panel {{
       pointer-events: auto;
-      min-width: 300px;
-      max-height: min(48vh, 380px);
+      min-width: 430px;
+      max-width: min(560px, 98vw);
+      max-height: min(70vh, 480px);
       overflow: auto;
-      background: rgba(255, 255, 255, 0.88);
-      color: #1e293b;
-      border: 1px solid rgba(15, 23, 42, 0.12);
-      border-radius: 10px;
-      box-shadow: 0 10px 40px rgba(15, 23, 42, 0.15);
-      backdrop-filter: blur(10px);
-      -webkit-backdrop-filter: blur(10px);
-      padding: 10px 12px;
-      font-size: 12px;
-      line-height: 1.35;
+      background: #000000;
+      color: #ff2020;
+      border: 1px solid #441818;
+      border-radius: 4px;
+      box-shadow: 0 8px 28px rgba(0,0,0,0.5);
+      padding: 6px 8px;
+      font-size: 11px;
+      line-height: 1.2;
     }}
     .sector-stock-mask-title {{
       font-weight: bold;
-      margin-bottom: 8px;
-      border-bottom: 1px solid rgba(15, 23, 42, 0.1);
-      padding-bottom: 6px;
-      color: #0f172a;
+      margin-bottom: 4px;
+      padding-bottom: 4px;
+      border-bottom: 1px solid #331111;
+      color: #ff2020;
+      font-size: 11px;
     }}
     .sector-stock-grid.sector-stock-table {{
-      display: flex;
-      flex-direction: column;
-      border: 1px solid rgba(15, 23, 42, 0.1);
-      border-radius: 6px;
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #6b7280;
+      border-radius: 3px;
       overflow: hidden;
-      min-width: 280px;
     }}
-    .sg-row {{
-      display: grid;
-      grid-template-columns: 88px 1fr 52px;
-      column-gap: 8px;
-      align-items: center;
-      padding: 5px 8px;
-      min-height: 26px;
-      border-bottom: 1px solid rgba(15, 23, 42, 0.07);
-      background: rgba(248, 250, 252, 0.65);
-    }}
-    .sg-row:last-child {{ border-bottom: none; }}
-    .sg-row.sg-head {{
-      font-weight: 600;
-      background: rgba(15, 23, 42, 0.06);
-      color: #334155;
-    }}
-    .sg-code {{
-      font-family: ui-monospace, Consolas, monospace;
+    .sg-table {{
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
       font-size: 11px;
-      text-align: left;
+      line-height: 1.25;
+      font-variant-numeric: tabular-nums;
+      margin: 0;
     }}
-    .sg-name {{
-      text-align: left;
+    .sg-table col.sgc-idx {{ width: 28px; }}
+    .sg-table col.sgc-code {{ width: 72px; }}
+    .sg-table col.sgc-name {{ width: auto; }}
+    .sg-table col.sgc-q {{ width: 60px; }}
+    .sg-table col.sgc-chg {{ width: 56px; }}
+    .sg-table col.sgc-hs {{ width: 52px; }}
+    .sg-table thead th {{
+      background: #141414;
+      color: #9ca3af;
+      font-weight: 600;
+      padding: 3px 5px;
+      border: 1px solid #9ca3af;
+      vertical-align: middle;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
-      min-width: 0;
     }}
-    .sg-chg {{
+    .sg-table thead .sg-idx,
+    .sg-table thead .sg-q,
+    .sg-table thead .sg-chg,
+    .sg-table thead .sg-hs {{ text-align: right; }}
+    .sg-table thead .sg-code,
+    .sg-table thead .sg-name {{ text-align: left; }}
+    .sg-table tbody td {{
+      padding: 2px 5px;
+      border: 1px solid #6b7280;
+      vertical-align: middle;
+    }}
+    .sg-table tbody .sg-idx {{
       text-align: right;
-      color: #64748b;
-      font-variant-numeric: tabular-nums;
+      color: #aa3333;
+    }}
+    .sg-table tbody .sg-code {{
+      font-family: ui-monospace, Consolas, monospace;
+      color: #ff6666;
+      text-align: left;
+    }}
+    .sg-table tbody .sg-name {{
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 0;
+      color: #ff4040;
+      text-align: left;
+    }}
+    .sg-table tbody .sg-q {{
+      text-align: right;
+      color: #ff5555;
+    }}
+    .sg-table tbody .sg-chg {{
+      text-align: right;
+      color: #ff3030;
+    }}
+    .sg-table tbody .sg-chg.sg-up {{ color: #ff2020; font-weight: 600; }}
+    .sg-table tbody .sg-chg.sg-down {{ color: #1e9fd0; font-weight: 600; }}
+    .sg-table tbody tr.sg-row-hi-turn td.sg-chg.sg-down {{ color: #0c6f8c !important; }}
+    .sg-table tbody .sg-hs {{
+      text-align: right;
+      color: #ff5555;
+      white-space: nowrap;
+    }}
+    .sg-table tbody tr.sg-row-hi-turn {{
+      background: #fde047 !important;
+    }}
+    .sg-table tbody tr.sg-row-hi-turn td {{
+      color: #991b1b !important;
+      border-color: #a8a29e !important;
     }}
     .sector-stock-grid.sector-stock-msg .sg-msg-full {{
-      padding: 8px;
+      padding: 6px;
       word-break: break-word;
+      color: #ff5555;
     }}
-    .sector-stock-hint {{ margin-top: 8px; font-size: 11px; color: #64748b; }}
+    .sector-stock-hint {{ margin-top: 6px; font-size: 10px; color: #994444; }}
   </style>
 </head>
 <body>
@@ -1429,7 +2321,7 @@ class 多周期Rps报告页面:
     <label>起始日期：</label><input type="date" id="startDate" value="{default_start}">
     <label>结束日期：</label><input type="date" id="endDate" value="{default_end}">
     <button onclick="updateTables()">应用</button>
-    <span style="margin-left:20px;">默认显示最近{default_days}天</span>
+    <span style="margin-left:20px;">默认最近{default_days}个交易日；修改结束日期时自动将起始日期对齐为向前{default_days}个交易日（便于历史复盘）。</span>
   </div>
 
   <div class="layout">
@@ -1456,7 +2348,7 @@ class 多周期Rps报告页面:
   <div class="sector-stock-mask-panel" id="sector-stock-mask-panel">
     <div class="sector-stock-mask-title" id="sector-stock-mask-title">成分股</div>
     <div class="sector-stock-grid" id="sector-stock-grid"></div>
-    <div class="sector-stock-hint" id="sector-stock-hint">数据来源：sector_stocks_daily（最多 20 条）</div>
+    <div class="sector-stock-hint" id="sector-stock-hint">序号 · 代码 · 名称 · 收盘价 · 涨幅 · 换手率（涨幅降序 TOP20）</div>
   </div>
 </div>
 
@@ -1481,16 +2373,19 @@ class 多周期Rps报告页面:
   }};
 
   let activeBoard = 'industry';
+  const rangeTradingDays = {default_days};
   const poolTitles = {{ '🔥核心': '核心池', '📈趋势': '趋势池', '🆕新生': '新生池', '🏆前20': '前20' }};
   const poolColors = {{ '🔥核心': 'core-title', '📈趋势': 'trend-title', '🆕新生': 'new-title', '🏆前20': 'trend-title' }};
   let sectorHoverTimer = null;
   let sectorLeaveTimer = null;
+  let sectorStocksAbort = null;
 
   function hideSectorMask() {{
     const m = document.getElementById('sector-stock-mask');
     if (m) m.classList.remove('visible');
     if (sectorHoverTimer) {{ clearTimeout(sectorHoverTimer); sectorHoverTimer = null; }}
     if (sectorLeaveTimer) {{ clearTimeout(sectorLeaveTimer); sectorLeaveTimer = null; }}
+    if (sectorStocksAbort) {{ try {{ sectorStocksAbort.abort(); }} catch (e) {{}} sectorStocksAbort = null; }}
   }}
 
   function positionSectorPanelNear(anchorEl) {{
@@ -1527,21 +2422,78 @@ class 多周期Rps报告页面:
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }}
 
+  function sgTurnoverPctAndHi(s) {{
+    let n = null;
+    if (s.turnover_num != null && s.turnover_num !== '') {{
+      const v = Number(s.turnover_num);
+      if (!isNaN(v)) n = v;
+    }}
+    if (n == null) {{
+      const raw = (s.turnover != null) ? String(s.turnover) : '';
+      const t = raw.replace(/换手/g, '').replace(/\\s+/g, ' ').trim();
+      const m = t.match(/-?[\\d.]+/);
+      if (m) {{
+        const v = parseFloat(m[0]);
+        if (!isNaN(v)) n = v;
+      }}
+    }}
+    const text = (n != null && !isNaN(n)) ? (n.toFixed(2) + '%') : '--';
+    const hi = (n != null && !isNaN(n) && n > 30);
+    return {{ n: n, text: text, hi: hi }};
+  }}
+
   function renderSectorStockTable(stocks) {{
     const list = (stocks || []).slice(0, 20);
-    const head = '<div class="sg-row sg-head"><span class="sg-code">代码</span><span class="sg-name">名称</span><span class="sg-chg">涨幅</span></div>';
-    const rows = list.map(function(s) {{
-      const code = sgEsc(s.code || '');
+    const head =
+      '<table class="sg-table" cellspacing="0">' +
+      '<colgroup>' +
+      '<col class="sgc-idx" /><col class="sgc-code" /><col class="sgc-name" />' +
+      '<col class="sgc-q" /><col class="sgc-chg" /><col class="sgc-hs" />' +
+      '</colgroup>' +
+      '<thead><tr>' +
+      '<th class="sg-idx">序号</th>' +
+      '<th class="sg-code">代码</th>' +
+      '<th class="sg-name">名称</th>' +
+      '<th class="sg-q">收盘价</th>' +
+      '<th class="sg-chg">涨幅</th>' +
+      '<th class="sg-hs">换手率</th>' +
+      '</tr></thead><tbody>';
+    const body = list.map(function(s, i) {{
+      const idx = i + 1;
+      const code = sgEsc((s.code != null) ? String(s.code).trim() : '');
       let nm = (s.name != null && String(s.name).trim() !== '') ? String(s.name).trim() : '';
       if (!nm && s.text) {{
         const t = String(s.text);
         const sp = t.indexOf(' ');
         nm = sp > 0 ? t.slice(sp + 1).trim() : '';
       }}
-      const chg = (s.chg != null && String(s.chg).trim() !== '') ? String(s.chg).trim() : '';
-      return '<div class="sg-row"><span class="sg-code">' + code + '</span><span class="sg-name">' + sgEsc(nm) + '</span><span class="sg-chg">' + sgEsc(chg) + '</span></div>';
+      const qfq = (s.qfq_close != null && String(s.qfq_close).trim() !== '')
+        ? String(s.qfq_close).trim()
+        : ((s.qfq_price != null && String(s.qfq_price).trim() !== '') ? String(s.qfq_price).trim() : '--');
+      const chg = (s.chg != null && String(s.chg).trim() !== '') ? String(s.chg).trim() : '--';
+      const to = sgTurnoverPctAndHi(s);
+      const trAttr = to.hi ? ' class="sg-row-hi-turn"' : '';
+      let cls = '';
+      if (chg !== '--') {{
+        const m = chg.replace(/%/g, '').trim().match(/-?[\\d.]+/);
+        if (m) {{
+          const v = parseFloat(m[0]);
+          if (!isNaN(v)) {{
+            if (v < 0) cls = 'sg-down';
+            else if (v > 0) cls = 'sg-up';
+          }}
+        }}
+      }}
+      return '<tr' + trAttr + '>' +
+        '<td class="sg-idx">' + idx + '</td>' +
+        '<td class="sg-code">' + code + '</td>' +
+        '<td class="sg-name" title="' + sgEsc(nm) + '">' + sgEsc(nm || '--') + '</td>' +
+        '<td class="sg-q">' + sgEsc(qfq) + '</td>' +
+        '<td class="sg-chg ' + cls + '">' + sgEsc(chg) + '</td>' +
+        '<td class="sg-hs">' + sgEsc(to.text) + '</td>' +
+        '</tr>';
     }}).join('');
-    return head + rows;
+    return head + body + '</tbody></table>';
   }}
 
   function setSectorGridMsg(html) {{
@@ -1550,10 +2502,22 @@ class 多周期Rps报告页面:
     grid.innerHTML = '<div class="sg-msg-full">' + html + '</div>';
   }}
 
+  function formatSectorHoverTitle(boardCode, tradeDate, displayName) {{
+    const c = (boardCode != null) ? String(boardCode).trim() : '';
+    const n = (displayName != null) ? String(displayName).trim() : '';
+    const d = (tradeDate != null) ? String(tradeDate).trim() : '';
+    let head = '成分股';
+    if (c && n && c !== n) head = c + ' ' + n;
+    else if (n) head = n;
+    else if (c) head = c;
+    return d ? (head + ' · ' + d) : head;
+  }}
+
   async function loadSectorStocks(boardCode, tradeDate, displayName, anchorEl) {{
     const mask = document.getElementById('sector-stock-mask');
     const title = document.getElementById('sector-stock-mask-title');
     const grid = document.getElementById('sector-stock-grid');
+    const hint = document.getElementById('sector-stock-hint');
     if (!boardCode) {{
       title.textContent = '成分股';
       setSectorGridMsg('无板块代码，无法查询成分股');
@@ -1561,7 +2525,8 @@ class 多周期Rps报告页面:
       finalizeSectorPanel(anchorEl);
       return;
     }}
-    title.textContent = (displayName || boardCode) + ' · ' + tradeDate;
+    title.textContent = formatSectorHoverTitle(boardCode, tradeDate, displayName);
+    if (hint) hint.textContent = '序号 · 代码 · 名称 · 收盘价 · 涨幅 · 换手率（TOP20）';
     setSectorGridMsg('加载中…');
     mask.classList.add('visible');
     finalizeSectorPanel(anchorEl);
@@ -1580,7 +2545,13 @@ class 多周期Rps报告页面:
       const u = new URL('/api/rps-board-stocks', location.origin);
       u.searchParams.set('sector_code', boardCode);
       u.searchParams.set('trade_date', tradeDate);
-      const r = await fetch(u.toString(), {{ cache: 'no-store', credentials: 'same-origin' }});
+      if (sectorStocksAbort) {{ try {{ sectorStocksAbort.abort(); }} catch (e) {{}} }}
+      sectorStocksAbort = new AbortController();
+      const r = await fetch(u.toString(), {{
+        cache: 'no-store',
+        credentials: 'same-origin',
+        signal: sectorStocksAbort.signal
+      }});
       if (!r.ok) {{
         setSectorGridMsg('接口返回 ' + r.status + ' ' + (r.statusText || ''));
         finalizeSectorPanel(anchorEl);
@@ -1588,6 +2559,21 @@ class 多周期Rps报告页面:
       }}
       const j = await r.json();
       const stocks = (j && j.stocks) ? j.stocks : [];
+      if (hint) {{
+        const md = (j && j.metric_date) ? String(j.metric_date) : '';
+        const snap = (j && j.sector_snapshot_date) ? String(j.sector_snapshot_date) : '';
+        const cellTd = (j && j.target_date) ? String(j.target_date) : '';
+        let parts = [];
+        if (snap) {{
+          if (cellTd && snap !== cellTd.slice(0, 10)) {{
+            parts.push('成分股快照：' + snap + '（单元格日 ' + cellTd.slice(0, 10) + ' 无入库记录，已用最近快照）');
+          }} else {{
+            parts.push('成分股快照：' + snap);
+          }}
+        }}
+        if (md) parts.push('指标日期：' + md);
+        hint.textContent = parts.length ? parts.join('；') : '序号 · 代码 · 名称 · 收盘价 · 涨幅 · 换手率（TOP20）';
+      }}
       if (!stocks.length) {{
         setSectorGridMsg((j && j.error) ? sgEsc(j.error) : '暂无成分股（请先执行成分股入库）');
         finalizeSectorPanel(anchorEl);
@@ -1597,6 +2583,7 @@ class 多周期Rps报告页面:
       grid.innerHTML = renderSectorStockTable(stocks);
       finalizeSectorPanel(anchorEl);
     }} catch (e) {{
+      if (e && e.name === 'AbortError') return;
       const msg = (e && e.message) ? e.message : String(e);
       setSectorGridMsg('加载失败：' + sgEsc(msg) + '（请确认 web_app 已启动，且通过 http 访问本报告，勿用本地文件双击打开）');
       finalizeSectorPanel(anchorEl);
@@ -1605,7 +2592,35 @@ class 多周期Rps报告页面:
 
   function scheduleSectorMask(boardCode, tradeDate, displayName, anchorEl) {{
     if (sectorHoverTimer) clearTimeout(sectorHoverTimer);
+    if (sectorStocksAbort) {{ try {{ sectorStocksAbort.abort(); }} catch (e) {{}} }}
     sectorHoverTimer = setTimeout(() => loadSectorStocks(boardCode, tradeDate, displayName, anchorEl), 160);
+  }}
+
+  function indexOfTradeDayOnOrBefore(allDates, ymd) {{
+    if (!allDates || !ymd) return -1;
+    let lo = 0, hi = allDates.length - 1, ans = -1;
+    while (lo <= hi) {{
+      const mid = (lo + hi) >> 1;
+      if (allDates[mid] <= ymd) {{ ans = mid; lo = mid + 1; }} else {{ hi = mid - 1; }}
+    }}
+    return ans;
+  }}
+
+  /** 按当前板块交易日历：将结束日对齐到不大于所选日的最近交易日，并把起始日设为向前 rangeTradingDays 个交易日（含起止共 N 列）。 */
+  function syncStartFromEndDate() {{
+    const allDates = boardData[activeBoard].allDates || [];
+    const endEl = document.getElementById('endDate');
+    const startEl = document.getElementById('startDate');
+    if (!allDates.length || !endEl || !startEl) return;
+    const picked = endEl.value;
+    if (!picked) return;
+    let idx = allDates.indexOf(picked);
+    if (idx === -1) idx = indexOfTradeDayOnOrBefore(allDates, picked);
+    if (idx === -1) return;
+    endEl.value = allDates[idx];
+    const span = Math.max(1, rangeTradingDays);
+    const startIdx = Math.max(0, idx - (span - 1));
+    startEl.value = allDates[startIdx];
   }}
 
   function getDatesInRange(start, end) {{
@@ -1766,6 +2781,7 @@ class 多周期Rps报告页面:
       tabs.forEach(b => b.classList.remove('active'));
       this.classList.add('active');
       activeBoard = this.getAttribute('data-board');
+      syncStartFromEndDate();
       updateTables();
     }}));
   }}
@@ -1777,6 +2793,11 @@ class 多周期Rps报告页面:
   }}
 
   window.onload = function() {{
+    const endDateEl = document.getElementById('endDate');
+    if (endDateEl) endDateEl.addEventListener('change', function() {{
+      syncStartFromEndDate();
+      updateTables();
+    }});
     setupBoardTabs();
     setupPoolTabs();
     renderAllTables('{default_start}', '{default_end}');
@@ -1810,6 +2831,11 @@ class 多周期Rps报告任务:
         self.view = 多周期Rps报告页面()
 
     def run(self):
+        from RPS_FINAL_06.console_hints import print_run06_preparation_hints
+
+        print_run06_preparation_hints()
+        print()
+
         t0 = time.perf_counter()
         t_prev = t0
 
@@ -1871,6 +2897,125 @@ class 多周期Rps报告任务:
         print(f"[TIMER][run06] total_elapsed: {time.perf_counter() - t0:.3f}s")
 
 
+def run_incremental_ingest(
+    include_board: bool = True,
+    include_stock: bool = True,
+    include_sector: bool = True,
+    trade_date: str | None = None,
+) -> dict:
+    """
+    独立增量入库入口：板块RPS / 个股RPS / 板块成分股（可按开关选择）。
+    """
+    t0 = time.perf_counter()
+    result = {
+        "ok": True,
+        "board_inserted": 0,
+        "stock_inserted": 0,
+        "sector_inserted": 0,
+        "sector_ok": False,
+        "elapsed_s": 0.0,
+        "target_trade_date": "",
+        "errors": [],
+    }
+    print(
+        f"[INC] run_incremental_ingest start: include_board={include_board}, include_stock={include_stock}, "
+        f"include_sector={include_sector}, trade_date={trade_date or ''}"
+    )
+    try:
+        cfg = 多周期报告配置()
+        if not cfg.sqlserver_enabled():
+            msg = "SQL Server 未启用，无法执行增量入库。"
+            print(f"[INC] {msg}")
+            result["ok"] = False
+            result["errors"].append(msg)
+            result["elapsed_s"] = round(time.perf_counter() - t0, 3)
+            return result
+
+        biz = 板块Rps分析服务(cfg)
+        context = None
+        target_trade_date = None
+        if trade_date:
+            try:
+                target_trade_date = datetime.strptime(str(trade_date).strip(), "%Y-%m-%d").date()
+                result["target_trade_date"] = target_trade_date.isoformat()
+            except Exception:
+                err = f"invalid_trade_date: {trade_date} (expected YYYY-MM-DD)"
+                print(f"[INC] {err}")
+                result["ok"] = False
+                result["errors"].append(err)
+                result["elapsed_s"] = round(time.perf_counter() - t0, 3)
+                return result
+
+        if include_board:
+            try:
+                print("[INC] 开始板块RPS增量入库...")
+                context = biz.build_report_context()
+                db_board = biz.build_board_daily_db_frame(context)
+                if target_trade_date is not None and db_board is not None and not db_board.empty:
+                    db_board = db_board[db_board["trade_date"] == target_trade_date].copy()
+                db_writer_board = 板块Rps数据库写入(cfg)
+                result["board_inserted"] = int(db_writer_board.write_daily_rps_incremental(db_board))
+            except Exception as e:
+                err = f"board_incremental_failed: {e}"
+                print(f"[INC] {err}")
+                result["ok"] = False
+                result["errors"].append(err)
+
+        if include_stock:
+            try:
+                print("[INC] 开始个股RPS增量入库...")
+                db_stock = biz.build_stock_daily_db_frame()
+                if target_trade_date is not None and db_stock is not None and not db_stock.empty:
+                    db_stock = db_stock[db_stock["trade_date"] == target_trade_date].copy()
+                db_writer_stock = 个股Rps数据库写入(cfg)
+                result["stock_inserted"] = int(db_writer_stock.write_stock_daily_rps_incremental(db_stock))
+            except Exception as e:
+                err = f"stock_incremental_failed: {e}"
+                print(f"[INC] {err}")
+                result["ok"] = False
+                result["errors"].append(err)
+
+        if include_sector:
+            try:
+                print("[INC] 开始板块成分股增量入库...")
+                sec_ok, sec_inserted = 板块成分股每日入库服务(cfg).run_incremental(
+                    target_trade_date=target_trade_date
+                )
+                result["sector_ok"] = bool(sec_ok)
+                result["sector_inserted"] = int(sec_inserted or 0)
+                if not sec_ok:
+                    result["ok"] = False
+                    result["errors"].append("sector_incremental_failed")
+            except Exception as e:
+                err = f"sector_incremental_failed: {e}"
+                print(f"[INC] {err}")
+                result["ok"] = False
+                result["sector_ok"] = False
+                result["errors"].append(err)
+    except Exception as e:
+        err = f"incremental_ingest_fatal: {e}"
+        print(f"[INC] {err}")
+        result["ok"] = False
+        result["errors"].append(err)
+    finally:
+        result["elapsed_s"] = round(time.perf_counter() - t0, 3)
+        print(
+            f"[INC] done: ok={result['ok']}, board={result['board_inserted']}, stock={result['stock_inserted']}, "
+            f"sector={result['sector_inserted']}, sector_ok={result['sector_ok']}, elapsed_s={result['elapsed_s']}"
+        )
+    return result
+
+
+def run_gap_backfill_ingest() -> dict:
+    """
+    缺口回填：对比 extdata 板块宽表与库表 trade_date，补板块 → 写 cache/last_gap_trade_dates.json
+    → 成分股 → 个股（仅差额日）。详见 RPS_FINAL_06.gap_backfill_ingest。
+    """
+    from RPS_FINAL_06.gap_backfill_ingest import run_gap_backfill_ingest as _gap
+
+    return _gap()
+
+
 def main():
     app = 多周期Rps报告任务()
     app.run()
@@ -1891,8 +3036,8 @@ REPORT_CACHE_MODULE_NAME = "rps_report_final_06"
 
 def extdata_dat_paths_for_cache(extdata_dir: str | None = None) -> list:
     """
-    参与缓存失效判断的 extdata 数据文件：板块 1~4、9 + 个股 5~8、10。
-    与项目根目录 Tdx_ext_data_reader 中 RPS_FILE_MAP / STOCK_RPS_FILE_MAP 对应。
+    参与缓存失效判断的 extdata 数据文件：板块 1~4、9 + 个股 5~8、10 + 个股换手率 11。
+    与项目根目录 Tdx_ext_data_reader 中 RPS_FILE_MAP / STOCK_RPS_FILE_MAP / extdata_11 对应。
     """
     cfg = load_project_config()
     wr = os.path.abspath(
@@ -1911,11 +3056,11 @@ def extdata_dat_paths_for_cache(extdata_dir: str | None = None) -> list:
                 base = getattr(mod, "DEFAULT_EXTDATA_DIR", None) or base
     if not base:
         base = wr
-    return [os.path.join(base, f"extdata_{i}.dat") for i in range(1, 11)]
+    return [os.path.join(base, f"extdata_{i}.dat") for i in range(1, 12)]
 
 
 def extdata_mtime_cache_key(extdata_dir: str | None = None) -> str:
-    """extdata_1~10.dat 中最新 mtime（毫秒级整数串）；缺失文件按 0 处理。"""
+    """extdata_1~11.dat 中最新 mtime（毫秒级整数串）；缺失文件按 0 处理。"""
     mt = []
     for p in extdata_dat_paths_for_cache(extdata_dir):
         try:

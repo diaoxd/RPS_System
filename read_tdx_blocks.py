@@ -22,6 +22,7 @@
 """
 from struct import unpack
 import os
+import re
 import sqlite3
 from datetime import datetime
 import pandas as pd
@@ -75,6 +76,87 @@ def read_cfg_lines(filepath, sep='|', encoding='gbk'):
     with open(filepath, 'r', encoding=encoding) as f:
         lines = f.read().strip().split('\n')
     return [line.strip().split(sep) for line in lines if line.strip()]
+
+
+def _six_digits_from_sector_field(code: object) -> str:
+    """从 cfg/API 杂格式中提取连续 6 位数字（与板块 RPS 表 board_code 对齐）。"""
+    if code is None:
+        return ""
+    s = str(code).strip().upper()
+    if not s:
+        return ""
+    m = re.search(r"(\d{6})", s)
+    return m.group(1) if m else ""
+
+
+def load_rps_board_codes_from_tdxzs3(
+    hq_cache_dir: str | None = None,
+    *,
+    block_types: tuple[str, ...] = ("hy", "gn", "yjhy"),
+) -> set[str]:
+    """
+    从 hq_cache/tdxzs3.cfg 扫描「主报告关心的板块」编码白名单。
+
+    默认包含：行业(hy)、概念(gn)、一级行业(yjhy)，与主报告行业/概念视图数据来源一致，
+    用于板块成分股入库时过滤 tqcenter 返回的全量板块（避免地区/指数等脏数据）。
+
+    参数:
+        hq_cache_dir: 通达信 hq_cache 目录；为空则使用本模块启动时读入的 DATAPATH（见 project_config paths.tdx_hq_cache_dir）。
+        block_types: tdxzs3 第三列 type 对应的类别键，见 BLOCK_TYPE_MAPPING。
+
+    返回:
+        归一化后的 6 位板块代码集合；文件不存在或解析失败时返回空集合（调用方可回退为仅 880/881 前缀）。
+    """
+    base = (hq_cache_dir or "").strip() or DATAPATH
+    fp = os.path.join(base, "tdxzs3.cfg")
+    if not os.path.isfile(fp):
+        return set()
+    try:
+        rows = read_cfg_lines(fp, "|")
+    except OSError:
+        return set()
+    if not rows:
+        return set()
+
+    def _pad_row(r):
+        r = list(r)
+        while len(r) < 6:
+            r.append("")
+        return r[:6]
+
+    rows = [_pad_row(r) for r in rows]
+    df = pd.DataFrame(rows, columns=["name", "code", "type", "t1", "t2", "block"])
+    out: set[str] = set()
+    for bt in block_types:
+        type_val = BLOCK_TYPE_MAPPING.get(bt)
+        if type_val is None:
+            continue
+        sub = df.loc[df["type"].astype(str).str.strip() == str(type_val)]
+        for _, row in sub.iterrows():
+            for key in ("code", "block"):
+                c = _six_digits_from_sector_field(row.get(key, ""))
+                if c:
+                    out.add(c)
+    return out
+
+
+def sector_import_passes_tdxzs3_whitelist(
+    db_code: str,
+    *,
+    use_whitelist: bool,
+    whitelist: set[str],
+) -> bool:
+    """
+    成分股入库是否保留该板块：开启白名单时仅 whitelist 中的 6 位码；
+    若 whitelist 为空（cfg 未扫到）则退化为仅 880/881 开头的标准板块指数。
+    """
+    if not db_code:
+        return False
+    if not use_whitelist:
+        return True
+    if whitelist:
+        return db_code in whitelist
+    return db_code.startswith("880") or db_code.startswith("881")
 
 
 def get_block_zs_tdx_loc(block='hy'):

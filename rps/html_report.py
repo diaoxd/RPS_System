@@ -89,7 +89,7 @@ class 多周期Rps报告页面:
     .added {{ color: #27ae60; font-weight: bold; }}
     .removed {{ color: #c0392b; font-weight: bold; }}
     .source-dest {{ font-weight: normal; color: #555; }}
-    /* 成分股：悬停时在板块单元格旁半透明浮动层，不遮整页 */
+    /* 成分股浮框：黑底红字；序号 + 代码 + 名称 + 收盘价 + 涨幅 + 换手（最多 20 行，数据来自接口/ stock_rps_daily 联表） */
     #sector-stock-mask {{
       display: none;
       position: fixed;
@@ -97,79 +97,124 @@ class 多周期Rps报告页面:
       left: 0;
       top: 0;
       width: max-content;
-      max-width: min(520px, 92vw);
+      max-width: min(560px, 98vw);
       pointer-events: none;
     }}
     #sector-stock-mask.visible {{ display: block; }}
     .sector-stock-mask-panel {{
       pointer-events: auto;
-      min-width: 300px;
-      max-height: min(48vh, 380px);
+      min-width: 430px;
+      max-width: min(560px, 98vw);
+      max-height: min(70vh, 480px);
       overflow: auto;
-      background: rgba(255, 255, 255, 0.88);
-      color: #1e293b;
-      border: 1px solid rgba(15, 23, 42, 0.12);
-      border-radius: 10px;
-      box-shadow: 0 10px 40px rgba(15, 23, 42, 0.15);
-      backdrop-filter: blur(10px);
-      -webkit-backdrop-filter: blur(10px);
-      padding: 10px 12px;
-      font-size: 12px;
-      line-height: 1.35;
+      background: #000000;
+      color: #ff2020;
+      border: 1px solid #441818;
+      border-radius: 4px;
+      box-shadow: 0 8px 28px rgba(0,0,0,0.5);
+      padding: 6px 8px;
+      font-size: 11px;
+      line-height: 1.2;
     }}
     .sector-stock-mask-title {{
       font-weight: bold;
-      margin-bottom: 8px;
-      border-bottom: 1px solid rgba(15, 23, 42, 0.1);
-      padding-bottom: 6px;
-      color: #0f172a;
+      margin-bottom: 4px;
+      padding-bottom: 4px;
+      border-bottom: 1px solid #331111;
+      color: #ff2020;
+      font-size: 11px;
     }}
     .sector-stock-grid.sector-stock-table {{
-      display: flex;
-      flex-direction: column;
-      border: 1px solid rgba(15, 23, 42, 0.1);
-      border-radius: 6px;
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #6b7280;
+      border-radius: 3px;
       overflow: hidden;
-      min-width: 280px;
     }}
-    .sg-row {{
-      display: grid;
-      grid-template-columns: 88px 1fr 52px;
-      column-gap: 8px;
-      align-items: center;
-      padding: 5px 8px;
-      min-height: 26px;
-      border-bottom: 1px solid rgba(15, 23, 42, 0.07);
-      background: rgba(248, 250, 252, 0.65);
-    }}
-    .sg-row:last-child {{ border-bottom: none; }}
-    .sg-row.sg-head {{
-      font-weight: 600;
-      background: rgba(15, 23, 42, 0.06);
-      color: #334155;
-    }}
-    .sg-code {{
-      font-family: ui-monospace, Consolas, monospace;
+    .sg-table {{
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
       font-size: 11px;
-      text-align: left;
+      line-height: 1.25;
+      font-variant-numeric: tabular-nums;
+      margin: 0;
     }}
-    .sg-name {{
-      text-align: left;
+    .sg-table col.sgc-idx {{ width: 28px; }}
+    .sg-table col.sgc-code {{ width: 72px; }}
+    .sg-table col.sgc-name {{ width: auto; }}
+    .sg-table col.sgc-q {{ width: 60px; }}
+    .sg-table col.sgc-chg {{ width: 56px; }}
+    .sg-table col.sgc-hs {{ width: 52px; }}
+    .sg-table thead th {{
+      background: #141414;
+      color: #9ca3af;
+      font-weight: 600;
+      padding: 3px 5px;
+      border: 1px solid #9ca3af;
+      vertical-align: middle;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
-      min-width: 0;
     }}
-    .sg-chg {{
+    .sg-table thead .sg-idx,
+    .sg-table thead .sg-q,
+    .sg-table thead .sg-chg,
+    .sg-table thead .sg-hs {{ text-align: right; }}
+    .sg-table thead .sg-code,
+    .sg-table thead .sg-name {{ text-align: left; }}
+    .sg-table tbody td {{
+      padding: 2px 5px;
+      border: 1px solid #6b7280;
+      vertical-align: middle;
+    }}
+    .sg-table tbody .sg-idx {{
       text-align: right;
-      color: #64748b;
-      font-variant-numeric: tabular-nums;
+      color: #aa3333;
+    }}
+    .sg-table tbody .sg-code {{
+      font-family: ui-monospace, Consolas, monospace;
+      color: #ff6666;
+      text-align: left;
+    }}
+    .sg-table tbody .sg-name {{
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 0;
+      color: #ff4040;
+      text-align: left;
+    }}
+    .sg-table tbody .sg-q {{
+      text-align: right;
+      color: #ff5555;
+    }}
+    .sg-table tbody .sg-chg {{
+      text-align: right;
+      color: #ff3030;
+    }}
+    .sg-table tbody .sg-chg.sg-up {{ color: #ff2020; font-weight: 600; }}
+    .sg-table tbody .sg-chg.sg-down {{ color: #1e9fd0; font-weight: 600; }}
+    .sg-table tbody tr.sg-row-hi-turn td.sg-chg.sg-down {{ color: #0c6f8c !important; }}
+    .sg-table tbody .sg-hs {{
+      text-align: right;
+      color: #ff5555;
+      white-space: nowrap;
+    }}
+    .sg-table tbody tr.sg-row-hi-turn {{
+      background: #fde047 !important;
+    }}
+    .sg-table tbody tr.sg-row-hi-turn td {{
+      color: #991b1b !important;
+      border-color: #a8a29e !important;
     }}
     .sector-stock-grid.sector-stock-msg .sg-msg-full {{
-      padding: 8px;
+      padding: 6px;
       word-break: break-word;
+      color: #ff5555;
     }}
-    .sector-stock-hint {{ margin-top: 8px; font-size: 11px; color: #64748b; }}
+    .sector-stock-hint {{ margin-top: 6px; font-size: 10px; color: #994444; }}
   </style>
 </head>
 <body>
@@ -206,7 +251,7 @@ class 多周期Rps报告页面:
   <div class="sector-stock-mask-panel" id="sector-stock-mask-panel">
     <div class="sector-stock-mask-title" id="sector-stock-mask-title">成分股</div>
     <div class="sector-stock-grid" id="sector-stock-grid"></div>
-    <div class="sector-stock-hint" id="sector-stock-hint">数据来源：sector_stocks_daily（最多 20 条）</div>
+    <div class="sector-stock-hint" id="sector-stock-hint">序号 · 代码 · 名称 · 收盘价 · 涨幅 · 换手率（涨幅降序 TOP20）</div>
   </div>
 </div>
 
@@ -277,27 +322,95 @@ class 多周期Rps报告页面:
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }}
 
+  function sgTurnoverPctAndHi(s) {{
+    let n = null;
+    if (s.turnover_num != null && s.turnover_num !== '') {{
+      const v = Number(s.turnover_num);
+      if (!isNaN(v)) n = v;
+    }}
+    if (n == null) {{
+      const raw = (s.turnover != null) ? String(s.turnover) : '';
+      const t = raw.replace(/换手/g, '').replace(/\\s+/g, ' ').trim();
+      const m = t.match(/-?[\\d.]+/);
+      if (m) {{
+        const v = parseFloat(m[0]);
+        if (!isNaN(v)) n = v;
+      }}
+    }}
+    const text = (n != null && !isNaN(n)) ? (n.toFixed(2) + '%') : '--';
+    const hi = (n != null && !isNaN(n) && n > 30);
+    return {{ n: n, text: text, hi: hi }};
+  }}
+
   function renderSectorStockTable(stocks) {{
     const list = (stocks || []).slice(0, 20);
-    const head = '<div class="sg-row sg-head"><span class="sg-code">代码</span><span class="sg-name">名称</span><span class="sg-chg">涨幅</span></div>';
-    const rows = list.map(function(s) {{
-      const code = sgEsc(s.code || '');
+    const head =
+      '<table class="sg-table" cellspacing="0">' +
+      '<colgroup>' +
+      '<col class="sgc-idx" /><col class="sgc-code" /><col class="sgc-name" />' +
+      '<col class="sgc-q" /><col class="sgc-chg" /><col class="sgc-hs" />' +
+      '</colgroup>' +
+      '<thead><tr>' +
+      '<th class="sg-idx">序号</th>' +
+      '<th class="sg-code">代码</th>' +
+      '<th class="sg-name">名称</th>' +
+      '<th class="sg-q">收盘价</th>' +
+      '<th class="sg-chg">涨幅</th>' +
+      '<th class="sg-hs">换手率</th>' +
+      '</tr></thead><tbody>';
+    const body = list.map(function(s, i) {{
+      const idx = i + 1;
+      const code = sgEsc((s.code != null) ? String(s.code).trim() : '');
       let nm = (s.name != null && String(s.name).trim() !== '') ? String(s.name).trim() : '';
       if (!nm && s.text) {{
         const t = String(s.text);
         const sp = t.indexOf(' ');
         nm = sp > 0 ? t.slice(sp + 1).trim() : '';
       }}
-      const chg = (s.chg != null && String(s.chg).trim() !== '') ? String(s.chg).trim() : '';
-      return '<div class="sg-row"><span class="sg-code">' + code + '</span><span class="sg-name">' + sgEsc(nm) + '</span><span class="sg-chg">' + sgEsc(chg) + '</span></div>';
+      const qfq = (s.qfq_close != null && String(s.qfq_close).trim() !== '')
+        ? String(s.qfq_close).trim()
+        : ((s.qfq_price != null && String(s.qfq_price).trim() !== '') ? String(s.qfq_price).trim() : '--');
+      const chg = (s.chg != null && String(s.chg).trim() !== '') ? String(s.chg).trim() : '--';
+      const to = sgTurnoverPctAndHi(s);
+      const trAttr = to.hi ? ' class="sg-row-hi-turn"' : '';
+      let cls = '';
+      if (chg !== '--') {{
+        const m = chg.replace(/%/g, '').trim().match(/-?[\\d.]+/);
+        if (m) {{
+          const v = parseFloat(m[0]);
+          if (!isNaN(v)) {{
+            if (v < 0) cls = 'sg-down';
+            else if (v > 0) cls = 'sg-up';
+          }}
+        }}
+      }}
+      return '<tr' + trAttr + '>' +
+        '<td class="sg-idx">' + idx + '</td>' +
+        '<td class="sg-code">' + code + '</td>' +
+        '<td class="sg-name" title="' + sgEsc(nm) + '">' + sgEsc(nm || '--') + '</td>' +
+        '<td class="sg-q">' + sgEsc(qfq) + '</td>' +
+        '<td class="sg-chg ' + cls + '">' + sgEsc(chg) + '</td>' +
+        '<td class="sg-hs">' + sgEsc(to.text) + '</td>' +
+        '</tr>';
     }}).join('');
-    return head + rows;
+    return head + body + '</tbody></table>';
   }}
 
   function setSectorGridMsg(html) {{
     const grid = document.getElementById('sector-stock-grid');
     grid.className = 'sector-stock-grid sector-stock-msg';
     grid.innerHTML = '<div class="sg-msg-full">' + html + '</div>';
+  }}
+
+  function formatSectorHoverTitle(boardCode, tradeDate, displayName) {{
+    const c = (boardCode != null) ? String(boardCode).trim() : '';
+    const n = (displayName != null) ? String(displayName).trim() : '';
+    const d = (tradeDate != null) ? String(tradeDate).trim() : '';
+    let head = '成分股';
+    if (c && n && c !== n) head = c + ' ' + n;
+    else if (n) head = n;
+    else if (c) head = c;
+    return d ? (head + ' · ' + d) : head;
   }}
 
   async function loadSectorStocks(boardCode, tradeDate, displayName, anchorEl) {{
@@ -311,7 +424,7 @@ class 多周期Rps报告页面:
       finalizeSectorPanel(anchorEl);
       return;
     }}
-    title.textContent = (displayName || boardCode) + ' · ' + tradeDate;
+    title.textContent = formatSectorHoverTitle(boardCode, tradeDate, displayName);
     setSectorGridMsg('加载中…');
     mask.classList.add('visible');
     finalizeSectorPanel(anchorEl);

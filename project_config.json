@@ -19,7 +19,7 @@
     ]
   },
   "report": {
-    "max_days": 250,
+    "max_days": 1000,
     "default_days": 30,
     "output_filename": "RPS_多周期分析报告_01.html"
   },
@@ -31,6 +31,7 @@
     "table": "board_rps_daily",
     "stock_rps_daily_table": "stock_rps_daily",
     "sector_stocks_table": "sector_stocks_daily",
-    "sector_stocks_import": true
+    "sector_stocks_import": true,
+    "sector_stocks_use_tdxzs3_whitelist": true
   }
 }

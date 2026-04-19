@@ -6,6 +6,9 @@ from datetime import date
 from rps import constants as C
 from rps.board_rps_sql import 板块Rps数据库写入
 from rps.report_settings import 多周期报告配置
+from trading_calendar_service import resolve_sector_constituents_trade_date
+
+from RPS_FINAL_06.block_rps_analysis_service import normalize_board_code_for_db
 
 
 def _sleep_after_sector_fetch(has_stocks: bool) -> None:
@@ -60,7 +63,8 @@ class 板块成分股每日入库服务:
     def run(self) -> tuple[bool, int]:
         import pyodbc
 
-        trade_date = date.today()
+        trade_date, td_note = resolve_sector_constituents_trade_date(None)
+        print(f"[成分股] sector_stocks_daily.trade_date={trade_date.isoformat()} ({td_note})")
         try:
             from tqcenter import tq as tq_mod
         except ImportError as e:
@@ -124,9 +128,9 @@ class 板块成分股每日入库服务:
                         _sleep_after_sector_fetch(False)
                         continue
                     for stock_code in stocks:
-                        sc = str(stock_code).strip()
-                        if sc:
-                            rows.append((trade_date, str(sector_code).strip(), str(sector_name).strip(), sc))
+                        sc_db = normalize_board_code_for_db(stock_code)
+                        if sc_db:
+                            rows.append((trade_date, str(sector_code).strip(), str(sector_name).strip(), sc_db))
                     _sleep_after_sector_fetch(True)
             finally:
                 tq.initialize = _orig_init

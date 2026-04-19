@@ -22,14 +22,14 @@ def _default_extdata_dir() -> str:
 
 def extdata_dat_paths_for_cache(extdata_dir: str | None = None) -> list:
     """
-    参与缓存失效判断的 extdata 数据文件：板块 1~4、9 + 个股 5~8、10。
+    参与缓存失效判断的 extdata 数据文件：板块 1~4、9 + 个股 5~8、10 + 个股换手率 11。
     """
     base = extdata_dir or _default_extdata_dir()
     return [os.path.join(base, f"extdata_{i}.dat") for i in C.EXTDATA_CACHE_DAT_INDICES]
 
 
 def extdata_mtime_cache_key(extdata_dir: str | None = None) -> str:
-    """extdata_1~10.dat 中最新 mtime（毫秒级整数串）；缺失文件按 0 处理。"""
+    """extdata_1~11.dat 中最新 mtime（毫秒级整数串）；缺失文件按 0 处理。"""
     mt = []
     for p in extdata_dat_paths_for_cache(extdata_dir):
         try:

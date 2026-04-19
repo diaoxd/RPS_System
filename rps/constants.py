@@ -16,8 +16,8 @@ CONSOLE_RUN_TAG = "run06"
 # 入口模块名：用于 generation_key 第三段，须与 web_app.REPORT_MODULE_NAME 一致
 REPORT_ENTRY_MODULE_NAME = "rps_report_final_06"
 
-# extdata 参与缓存的 .dat 序号（板块 1~4、9 + 个股 5~8、10）
-EXTDATA_CACHE_DAT_INDICES = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+# extdata 参与缓存的 .dat 序号（板块 1~4、9 + 个股 5~8、10 + 个股换手率 11）
+EXTDATA_CACHE_DAT_INDICES = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
 
 # ----- 路径默认值（可被 project_config / 环境变量覆盖） -----
 DEFAULT_TDX_ANALYSIS_DIR = (
@@ -26,7 +26,7 @@ DEFAULT_TDX_ANALYSIS_DIR = (
 DEFAULT_WORKSPACE_ROOT = r"c:\tool\RPS市场分析系统"
 
 # ----- 报告数值默认值 -----
-DEFAULT_MAX_DAYS = 250
+DEFAULT_MAX_DAYS = 500
 DEFAULT_DEFAULT_DAYS = 30
 
 # ----- 调度 -----

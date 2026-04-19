@@ -604,60 +604,9 @@ class 板块Rps分析服务:
         return out
 
     def build_stock_daily_db_frame(self) -> pd.DataFrame:
-        """读取 extdata_5~8、10 个股 RPS 合并宽表，对齐个股日表字段。"""
-        from rps.extdata_stock_rps import get_default_extdata_dir, load_all_stock_rps_merged
+        """与 RPS_FINAL_06 一致：extdata 个股 RPS+换手率+前复权合并后，输出 stock_rps_daily 入库表。"""
+        from RPS_FINAL_06.block_rps_analysis_service import BoardRpsAnalysisService
+        from RPS_FINAL_06.config import RpsFinal06Config
 
-        ext_dir = get_default_extdata_dir() or None
-        merged = load_all_stock_rps_merged(base_dir=ext_dir, scale_0_100=True)
-        if merged is None or merged.empty:
-            return pd.DataFrame()
-
-        rps_cols = [c for c in ("RPS120", "RPS60", "RPS20", "RPS10", "RPS5") if c in merged.columns]
-        if not rps_cols:
-            return pd.DataFrame()
-
-        work = merged.copy()
-        work["_c"] = work["code"].apply(self.normalize_code)
-        work = work[work["_c"] != ""]
-        all_dates = sorted(work["date"].unique())[-self.cfg.max_days :]
-        work = work[work["date"].isin(all_dates)]
-
-        # 至少有一个周期有值才保留（与原先 iterrows 条件一致）
-        work = work[work[rps_cols].notna().any(axis=1)]
-        if work.empty:
-            return pd.DataFrame()
-
-        name_map = self.load_stock_name_map()
-        col_to_db = {
-            "RPS5": "rps5",
-            "RPS10": "rps10",
-            "RPS20": "rps20",
-            "RPS60": "rps60",
-            "RPS120": "rps120",
-        }
-
-        # 向量化：避免对百万级行 iterrows（此前会卡十几分钟以上）
-        work["trade_date"] = pd.to_datetime(work["date"].astype(str), format="%Y%m%d", errors="coerce").dt.date
-        work = work[pd.notna(work["trade_date"])]
-        if work.empty:
-            return pd.DataFrame()
-
-        work["stock_code"] = work["_c"]
-        work["stock_name"] = work["_c"].map(name_map).fillna(work["_c"])
-
-        rename = {k: col_to_db[k] for k in rps_cols if k in col_to_db}
-        out = work.rename(columns=rename)
-        for c in (col_to_db[k] for k in rps_cols if k in col_to_db):
-            if c in out.columns:
-                out[c] = pd.to_numeric(out[c], errors="coerce").round(1)
-
-        for c in ("rps5", "rps10", "rps20", "rps60", "rps120"):
-            if c not in out.columns:
-                out[c] = np.nan
-
-        out = out[
-            ["trade_date", "stock_code", "stock_name", "rps5", "rps10", "rps20", "rps60", "rps120"]
-        ]
-        out = out.drop_duplicates(subset=["trade_date", "stock_code"], keep="last")
-        return out
+        return BoardRpsAnalysisService(RpsFinal06Config()).build_stock_daily_db_frame()
 
