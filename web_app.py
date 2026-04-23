@@ -480,11 +480,15 @@ def api_db_incremental_trigger():
         stock_raw = args.get("stock") if "stock" in args else body.get("stock")
         sector_raw = args.get("sector") if "sector" in args else body.get("sector")
         trade_date_raw = args.get("trade_date") if "trade_date" in args else body.get("trade_date")
+        mode_raw = args.get("mode") if "mode" in args else body.get("mode")
 
         include_board = _parse_bool_like(board_raw, default=True)
         include_stock = _parse_bool_like(stock_raw, default=True)
         include_sector = _parse_bool_like(sector_raw, default=True)
         trade_date = str(trade_date_raw).strip() if trade_date_raw is not None else ""
+        write_mode = str(mode_raw).strip().lower() if mode_raw is not None else ""
+        if write_mode and write_mode not in ("incremental", "overwrite", "full", "replace"):
+            return jsonify({"ok": False, "error": f"invalid mode: {write_mode} (expected incremental|overwrite)"})
         if trade_date:
             try:
                 datetime.strptime(trade_date, "%Y-%m-%d")
@@ -493,7 +497,7 @@ def api_db_incremental_trigger():
 
         print(
             f"[INC][API] trigger incremental ingest: board={include_board}, stock={include_stock}, "
-            f"sector={include_sector}, trade_date={trade_date or ''}"
+            f"sector={include_sector}, trade_date={trade_date or ''}, mode={write_mode or 'incremental'}"
         )
 
         import importlib
@@ -507,6 +511,7 @@ def api_db_incremental_trigger():
             include_stock=include_stock,
             include_sector=include_sector,
             trade_date=trade_date or None,
+            write_mode=write_mode or None,
         )
         if isinstance(result, dict):
             return jsonify(result)

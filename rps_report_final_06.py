@@ -171,6 +171,17 @@ class 多周期报告配置:
             "RPS_SQLSERVER_SECTOR_STOCKS_TABLE",
             get_cfg(self._cfg, "sqlserver", "sector_stocks_table", default="sector_stocks_daily"),
         ).strip() or "sector_stocks_daily"
+        self.sql_incremental_keep_trade_days = max(
+            1,
+            int(
+                os.environ.get(
+                    "RPS_SQL_INCREMENTAL_KEEP_DAYS",
+                    get_cfg(self._cfg, "sqlserver", "incremental_keep_trade_days", default=3),
+                )
+                or 3
+            ),
+        )
+        self.sql_write_mode = self._resolve_sql_write_mode()
 
     def sqlserver_enabled(self) -> bool:
         return bool(self.sqlserver_host and self.sqlserver_db and self.sqlserver_user and self.sqlserver_password)
@@ -201,6 +212,43 @@ class 多周期报告配置:
         if env in ("1", "true", "yes", "on"):
             return True
         return bool(get_cfg(self._cfg, "sqlserver", "sector_stocks_use_tdxzs3_whitelist", default=True))
+
+    def _resolve_sql_write_mode(self) -> str:
+        """
+        SQL 写入模式：
+        - incremental（默认）：仅插入不存在的 (trade_date, code)
+        - overwrite：按日期区间删除后重写（历史兼容行为）
+        """
+        raw = os.environ.get(
+            "RPS_SQL_WRITE_MODE",
+            get_cfg(self._cfg, "sqlserver", "write_mode", default="incremental"),
+        )
+        s = str(raw or "").strip().lower()
+        if s in ("overwrite", "full", "replace"):
+            return "overwrite"
+        return "incremental"
+
+    def sql_write_mode_is_overwrite(self) -> bool:
+        return self.sql_write_mode == "overwrite"
+
+    @staticmethod
+    def trim_df_to_recent_trade_days(df: pd.DataFrame, keep_days: int, label: str) -> pd.DataFrame:
+        """
+        增量写库前仅保留最近 N 个交易日候选，避免将整窗历史（数十万/数百万行）重复灌入临时表。
+        历史缺口由 gap-backfill 专门处理。
+        """
+        if df is None or df.empty or "trade_date" not in df.columns:
+            return df
+        days = sorted(df["trade_date"].dropna().unique())
+        if len(days) <= keep_days:
+            return df
+        keep_set = set(days[-keep_days:])
+        out = df[df["trade_date"].isin(keep_set)].copy()
+        print(
+            f"[INC][{label}] 候选按最近交易日裁剪: {len(df)} -> {len(out)} "
+            f"(keep_days={keep_days}, range={min(keep_set)}~{max(keep_set)})"
+        )
+        return out
 
 
 def _sector_code_passes_tdxzs3_whitelist(db_code: str, *, use_whitelist: bool, whitelist: set[str]) -> bool:
@@ -1187,6 +1235,50 @@ WHERE NOT EXISTS (
 );
 """
 
+        work = df.copy()
+        td_col = pd.to_datetime(work["trade_date"], errors="coerce")
+        work = work[td_col.notna()].copy()
+        if work.empty:
+            print("[INC][板块] trade_date 全为空，跳过。")
+            return 0
+        work["trade_date"] = td_col[td_col.notna()].dt.date.values
+        work["board_code"] = work["board_code"].astype(str).str.strip()
+        work = work[work["board_code"] != ""].copy()
+        if work.empty:
+            print("[INC][板块] board_code 全为空，跳过。")
+            return 0
+
+        # 先按日期范围读取库内已存在 key，在 Pandas 侧做 anti-join，避免把大量已存在行灌入临时表。
+        min_d = work["trade_date"].min()
+        max_d = work["trade_date"].max()
+        t_filter = time.perf_counter()
+        existing_keys: set[tuple[date, str]] = set()
+        sql_exist = (
+            f"SELECT CAST(trade_date AS DATE), LTRIM(RTRIM(CAST(board_code AS NVARCHAR(16)))) "
+            f"FROM dbo.{self.table_name} WHERE trade_date >= ? AND trade_date <= ?"
+        )
+        with pyodbc.connect(self.conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute(create_sql)
+            cursor.execute(sql_exist, min_d, max_d)
+            for row in cursor.fetchall():
+                if not row or row[0] is None:
+                    continue
+                d = row[0].date() if isinstance(row[0], datetime) else row[0]
+                c = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+                if c:
+                    existing_keys.add((d, c))
+        if existing_keys:
+            mask = [(d, c) not in existing_keys for d, c in zip(work["trade_date"], work["board_code"])]
+            work = work.loc[mask].copy()
+        print(
+            f"[INC][板块] Pandas anti-join 过滤: {len(df)} -> {len(work)}，"
+            f"已存在key={len(existing_keys)}，耗时 {time.perf_counter() - t_filter:.2f}s"
+        )
+        if work.empty:
+            print("[INC][板块] 候选均已存在，无需入库。")
+            return 0
+
         def _safe_num(v):
             if v is None:
                 return None
@@ -1202,7 +1294,7 @@ WHERE NOT EXISTS (
 
         rows = []
         now_ts = datetime.now()
-        for _, r in df.iterrows():
+        for _, r in work.iterrows():
             rows.append(
                 (
                     r["trade_date"],
@@ -1585,6 +1677,50 @@ WHERE NOT EXISTS (
 );
 """
 
+        work = df.copy()
+        td_col = pd.to_datetime(work["trade_date"], errors="coerce")
+        work = work[td_col.notna()].copy()
+        if work.empty:
+            print("[INC][个股] trade_date 全为空，跳过。")
+            return 0
+        work["trade_date"] = td_col[td_col.notna()].dt.date.values
+        work["stock_code"] = work["stock_code"].astype(str).str.strip()
+        work = work[work["stock_code"] != ""].copy()
+        if work.empty:
+            print("[INC][个股] stock_code 全为空，跳过。")
+            return 0
+
+        # 先查库内 key，再在 Pandas 侧 anti-join，避免对已存在数据做大批量临时表写入。
+        min_d = work["trade_date"].min()
+        max_d = work["trade_date"].max()
+        t_filter = time.perf_counter()
+        existing_keys: set[tuple[date, str]] = set()
+        sql_exist = (
+            f"SELECT CAST(trade_date AS DATE), LTRIM(RTRIM(CAST(stock_code AS NVARCHAR(16)))) "
+            f"FROM dbo.{tn} WHERE trade_date >= ? AND trade_date <= ?"
+        )
+        with pyodbc.connect(self.conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute(create_sql)
+            cursor.execute(sql_exist, min_d, max_d)
+            for row in cursor.fetchall():
+                if not row or row[0] is None:
+                    continue
+                d = row[0].date() if isinstance(row[0], datetime) else row[0]
+                c = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+                if c:
+                    existing_keys.add((d, c))
+        if existing_keys:
+            mask = [(d, c) not in existing_keys for d, c in zip(work["trade_date"], work["stock_code"])]
+            work = work.loc[mask].copy()
+        print(
+            f"[INC][个股] Pandas anti-join 过滤: {len(df)} -> {len(work)}，"
+            f"已存在key={len(existing_keys)}，耗时 {time.perf_counter() - t_filter:.2f}s"
+        )
+        if work.empty:
+            print("[INC][个股] 候选均已存在，无需入库。")
+            return 0
+
         def _nullable_float_col(series: pd.Series) -> np.ndarray:
             """转为 object 数组：非有限值 -> None，供 pyodbc 写 NULL。"""
             x = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64)
@@ -1609,36 +1745,36 @@ WHERE NOT EXISTS (
             return out
 
         t_rows = time.perf_counter()
-        n = len(df)
-        td_col = df["trade_date"]
+        n = len(work)
+        td_col = work["trade_date"]
         if pd.api.types.is_datetime64_any_dtype(td_col):
             trade_dates = list(td_col.dt.date)
         else:
             trade_dates = td_col.tolist()
 
-        sc_col = df["stock_code"].astype(str).str.strip()
+        sc_col = work["stock_code"].astype(str).str.strip()
         stock_codes = sc_col.tolist()
 
-        if "stock_name" in df.columns:
-            names = _nullable_name_col(df["stock_name"])
+        if "stock_name" in work.columns:
+            names = _nullable_name_col(work["stock_name"])
         else:
             names = [None] * n
 
-        r5 = _nullable_float_col(df["rps5"]) if "rps5" in df.columns else np.full(n, None, dtype=object)
-        r10 = _nullable_float_col(df["rps10"]) if "rps10" in df.columns else np.full(n, None, dtype=object)
-        r20 = _nullable_float_col(df["rps20"]) if "rps20" in df.columns else np.full(n, None, dtype=object)
-        r60 = _nullable_float_col(df["rps60"]) if "rps60" in df.columns else np.full(n, None, dtype=object)
-        r120 = _nullable_float_col(df["rps120"]) if "rps120" in df.columns else np.full(n, None, dtype=object)
-        pct = _nullable_float_col(df["pct_chg"]) if "pct_chg" in df.columns else np.full(n, None, dtype=object)
+        r5 = _nullable_float_col(work["rps5"]) if "rps5" in work.columns else np.full(n, None, dtype=object)
+        r10 = _nullable_float_col(work["rps10"]) if "rps10" in work.columns else np.full(n, None, dtype=object)
+        r20 = _nullable_float_col(work["rps20"]) if "rps20" in work.columns else np.full(n, None, dtype=object)
+        r60 = _nullable_float_col(work["rps60"]) if "rps60" in work.columns else np.full(n, None, dtype=object)
+        r120 = _nullable_float_col(work["rps120"]) if "rps120" in work.columns else np.full(n, None, dtype=object)
+        pct = _nullable_float_col(work["pct_chg"]) if "pct_chg" in work.columns else np.full(n, None, dtype=object)
         turn = (
-            _nullable_float_col(df["turnover_rate"]) if "turnover_rate" in df.columns else np.full(n, None, dtype=object)
+            _nullable_float_col(work["turnover_rate"]) if "turnover_rate" in work.columns else np.full(n, None, dtype=object)
         )
-        qo = _nullable_float_col(df["qfq_open"]) if "qfq_open" in df.columns else np.full(n, None, dtype=object)
-        qh = _nullable_float_col(df["qfq_high"]) if "qfq_high" in df.columns else np.full(n, None, dtype=object)
-        ql = _nullable_float_col(df["qfq_low"]) if "qfq_low" in df.columns else np.full(n, None, dtype=object)
-        qc = _nullable_float_col(df["qfq_close"]) if "qfq_close" in df.columns else np.full(n, None, dtype=object)
-        vol = _nullable_float_col(df["volume"]) if "volume" in df.columns else np.full(n, None, dtype=object)
-        amt = _nullable_float_col(df["amount"]) if "amount" in df.columns else np.full(n, None, dtype=object)
+        qo = _nullable_float_col(work["qfq_open"]) if "qfq_open" in work.columns else np.full(n, None, dtype=object)
+        qh = _nullable_float_col(work["qfq_high"]) if "qfq_high" in work.columns else np.full(n, None, dtype=object)
+        ql = _nullable_float_col(work["qfq_low"]) if "qfq_low" in work.columns else np.full(n, None, dtype=object)
+        qc = _nullable_float_col(work["qfq_close"]) if "qfq_close" in work.columns else np.full(n, None, dtype=object)
+        vol = _nullable_float_col(work["volume"]) if "volume" in work.columns else np.full(n, None, dtype=object)
+        amt = _nullable_float_col(work["amount"]) if "amount" in work.columns else np.full(n, None, dtype=object)
 
         now_ts = datetime.now()
         print(f"[INC][个股] 列向量化准备: {time.perf_counter() - t_rows:.2f}s, 候选 {n} 条（分批写入临时表）")
@@ -2862,20 +2998,51 @@ class 多周期Rps报告任务:
 
         if self.config.sqlserver_enabled():
             try:
+                t_db_board = time.perf_counter()
+                mode = "overwrite" if self.config.sql_write_mode_is_overwrite() else "incremental"
+                print(f"[DB][板块RPS] 开始入库 mode={mode} ...")
                 w_board = 板块Rps数据库写入(self.config)
-                n_b = w_board.write_daily_rps(db_board)
-                print(f"[DB] 板块入库 {n_b} 条 → {self.config.sqlserver_db}.dbo.{self.config.sqlserver_table}")
+                if self.config.sql_write_mode_is_overwrite():
+                    n_b = w_board.write_daily_rps(db_board)
+                else:
+                    db_board_inc = self.config.trim_df_to_recent_trade_days(
+                        db_board, self.config.sql_incremental_keep_trade_days, "板块RPS"
+                    )
+                    n_b = w_board.write_daily_rps_incremental(db_board_inc)
+                print(
+                    f"[DB][板块RPS] 结束：新增/写入 {n_b} 条，耗时 {time.perf_counter() - t_db_board:.2f}s "
+                    f"→ {self.config.sqlserver_db}.dbo.{self.config.sqlserver_table}"
+                )
             except Exception as e:
                 print(f"[DB] 板块入库失败: {e}")
             try:
+                t_db_stock = time.perf_counter()
+                mode = "overwrite" if self.config.sql_write_mode_is_overwrite() else "incremental"
+                print(f"[DB][个股RPS] 开始入库 mode={mode} ...")
                 w_stock = 个股Rps数据库写入(self.config)
-                n_s = w_stock.write_stock_daily_rps(db_stock)
-                print(f"[DB] 个股入库 {n_s} 条 → {self.config.sqlserver_db}.dbo.{self.config.sqlserver_stock_table}")
+                if self.config.sql_write_mode_is_overwrite():
+                    n_s = w_stock.write_stock_daily_rps(db_stock)
+                else:
+                    db_stock_inc = self.config.trim_df_to_recent_trade_days(
+                        db_stock, self.config.sql_incremental_keep_trade_days, "个股RPS"
+                    )
+                    n_s = w_stock.write_stock_daily_rps_incremental(db_stock_inc)
+                print(
+                    f"[DB][个股RPS] 结束：新增/写入 {n_s} 条，耗时 {time.perf_counter() - t_db_stock:.2f}s "
+                    f"→ {self.config.sqlserver_db}.dbo.{self.config.sqlserver_stock_table}"
+                )
             except Exception as e:
                 print(f"[DB] 个股入库失败: {e}")
             if self.config.sector_constituents_import_enabled():
                 try:
-                    板块成分股每日入库服务(self.config).run()
+                    t_db_sector = time.perf_counter()
+                    print("[DB][板块成分股映射] 开始入库 ...")
+                    sec_ok, sec_inserted = 板块成分股每日入库服务(self.config).run()
+                    print(
+                        f"[DB][板块成分股映射] 结束：新增/写入 {int(sec_inserted or 0)} 条，"
+                        f"ok={bool(sec_ok)}，耗时 {time.perf_counter() - t_db_sector:.2f}s "
+                        f"→ {self.config.sqlserver_db}.dbo.{self.config.sector_stocks_table}"
+                    )
                 except Exception as e:
                     print(f"[成分股] 未预期错误: {e}")
         else:
@@ -2902,6 +3069,7 @@ def run_incremental_ingest(
     include_stock: bool = True,
     include_sector: bool = True,
     trade_date: str | None = None,
+    write_mode: str | None = None,
 ) -> dict:
     """
     独立增量入库入口：板块RPS / 个股RPS / 板块成分股（可按开关选择）。
@@ -2919,10 +3087,12 @@ def run_incremental_ingest(
     }
     print(
         f"[INC] run_incremental_ingest start: include_board={include_board}, include_stock={include_stock}, "
-        f"include_sector={include_sector}, trade_date={trade_date or ''}"
+        f"include_sector={include_sector}, trade_date={trade_date or ''}, write_mode={write_mode or ''}"
     )
     try:
         cfg = 多周期报告配置()
+        mode_raw = str(write_mode or cfg.sql_write_mode or "").strip().lower()
+        use_overwrite = mode_raw in ("overwrite", "full", "replace")
         if not cfg.sqlserver_enabled():
             msg = "SQL Server 未启用，无法执行增量入库。"
             print(f"[INC] {msg}")
@@ -2948,13 +3118,25 @@ def run_incremental_ingest(
 
         if include_board:
             try:
-                print("[INC] 开始板块RPS增量入库...")
+                t_db_board = time.perf_counter()
+                mode = "overwrite" if use_overwrite else "incremental"
+                print(f"[INC][板块RPS] 开始入库 mode={mode} ...")
                 context = biz.build_report_context()
                 db_board = biz.build_board_daily_db_frame(context)
                 if target_trade_date is not None and db_board is not None and not db_board.empty:
                     db_board = db_board[db_board["trade_date"] == target_trade_date].copy()
                 db_writer_board = 板块Rps数据库写入(cfg)
-                result["board_inserted"] = int(db_writer_board.write_daily_rps_incremental(db_board))
+                if use_overwrite:
+                    result["board_inserted"] = int(db_writer_board.write_daily_rps(db_board))
+                else:
+                    db_board = cfg.trim_df_to_recent_trade_days(
+                        db_board, cfg.sql_incremental_keep_trade_days, "板块RPS"
+                    )
+                    result["board_inserted"] = int(db_writer_board.write_daily_rps_incremental(db_board))
+                print(
+                    f"[INC][板块RPS] 结束：新增/写入 {result['board_inserted']} 条，"
+                    f"耗时 {time.perf_counter() - t_db_board:.2f}s"
+                )
             except Exception as e:
                 err = f"board_incremental_failed: {e}"
                 print(f"[INC] {err}")
@@ -2963,12 +3145,24 @@ def run_incremental_ingest(
 
         if include_stock:
             try:
-                print("[INC] 开始个股RPS增量入库...")
+                t_db_stock = time.perf_counter()
+                mode = "overwrite" if use_overwrite else "incremental"
+                print(f"[INC][个股RPS] 开始入库 mode={mode} ...")
                 db_stock = biz.build_stock_daily_db_frame()
                 if target_trade_date is not None and db_stock is not None and not db_stock.empty:
                     db_stock = db_stock[db_stock["trade_date"] == target_trade_date].copy()
                 db_writer_stock = 个股Rps数据库写入(cfg)
-                result["stock_inserted"] = int(db_writer_stock.write_stock_daily_rps_incremental(db_stock))
+                if use_overwrite:
+                    result["stock_inserted"] = int(db_writer_stock.write_stock_daily_rps(db_stock))
+                else:
+                    db_stock = cfg.trim_df_to_recent_trade_days(
+                        db_stock, cfg.sql_incremental_keep_trade_days, "个股RPS"
+                    )
+                    result["stock_inserted"] = int(db_writer_stock.write_stock_daily_rps_incremental(db_stock))
+                print(
+                    f"[INC][个股RPS] 结束：新增/写入 {result['stock_inserted']} 条，"
+                    f"耗时 {time.perf_counter() - t_db_stock:.2f}s"
+                )
             except Exception as e:
                 err = f"stock_incremental_failed: {e}"
                 print(f"[INC] {err}")
@@ -2977,12 +3171,17 @@ def run_incremental_ingest(
 
         if include_sector:
             try:
-                print("[INC] 开始板块成分股增量入库...")
+                t_db_sector = time.perf_counter()
+                print("[INC][板块成分股映射] 开始入库 ...")
                 sec_ok, sec_inserted = 板块成分股每日入库服务(cfg).run_incremental(
                     target_trade_date=target_trade_date
                 )
                 result["sector_ok"] = bool(sec_ok)
                 result["sector_inserted"] = int(sec_inserted or 0)
+                print(
+                    f"[INC][板块成分股映射] 结束：新增/写入 {result['sector_inserted']} 条，"
+                    f"ok={result['sector_ok']}，耗时 {time.perf_counter() - t_db_sector:.2f}s"
+                )
                 if not sec_ok:
                     result["ok"] = False
                     result["errors"].append("sector_incremental_failed")
