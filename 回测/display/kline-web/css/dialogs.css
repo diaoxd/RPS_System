@@ -1,0 +1,207 @@
+.context-menu {
+    position: fixed;
+    background-color: #1f2937;
+    border: 1px solid #4B5563;
+    border-radius: 4px;
+    padding: 4px 0;
+    display: none;
+    z-index: 3000;
+    min-width: 150px;
+}
+
+.context-menu-item {
+    padding: 8px 16px;
+    color: #ffffff;
+    cursor: pointer;
+    font-size: 14px;
+    transition: background-color 0.2s;
+}
+
+.context-menu-item:hover {
+    background-color: #374151;
+}
+
+.macd-settings-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.7);
+    display: none;
+    justify-content: center;
+    align-items: center;
+    z-index: 2000;
+}
+
+.macd-settings-dialog {
+    background-color: #1f2937;
+    border: 1px solid #4B5563;
+    border-radius: 8px;
+    padding: 24px;
+    max-width: 350px;
+    width: 90%;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+}
+
+.macd-settings-title {
+    font-size: 18px;
+    font-weight: bold;
+    color: #ffffff;
+    margin-bottom: 20px;
+}
+
+.macd-settings-row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.macd-settings-label {
+    width: 120px;
+    color: #d1d5db;
+    font-size: 14px;
+}
+
+.macd-settings-input {
+    flex: 1;
+    padding: 6px 8px;
+    background-color: #374151;
+    border: 1px solid #4B5563;
+    border-radius: 4px;
+    color: #ffffff;
+    font-size: 14px;
+}
+
+/* 隐藏number输入框的上下调节小三角 */
+.macd-settings-input[type="number"]::-webkit-inner-spin-button,
+.macd-settings-input[type="number"]::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+.macd-settings-input[type="number"] {
+    -moz-appearance: textfield;
+}
+
+.macd-settings-input:focus {
+    outline: none;
+    border-color: #4a90e2;
+}
+
+.macd-settings-checkbox {
+    margin-right: 8px;
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+    accent-color: #4a90e2;
+}
+
+.macd-settings-buttons {
+    display: flex;
+    gap: 12px;
+    justify-content: flex-end;
+    margin-top: 24px;
+}
+
+.macd-settings-btn {
+    padding: 8px 20px;
+    border: none;
+    border-radius: 4px;
+    font-size: 14px;
+    cursor: pointer;
+    transition: background-color 0.3s;
+}
+
+.macd-settings-btn-cancel {
+    background-color: #374151;
+    color: #ffffff;
+}
+
+.macd-settings-btn-cancel:hover {
+    background-color: #4b5563;
+}
+
+.macd-settings-btn-confirm {
+    background-color: #4a90e2;
+    color: #ffffff;
+}
+
+.macd-settings-btn-confirm:hover {
+    background-color: #3b82f6;
+}
+
+.macd-settings-btn-default:hover {
+    background-color: #d97706 !important;
+}
+
+.confirm-dialog-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.7);
+    display: none;
+    justify-content: center;
+    align-items: center;
+    z-index: 2000;
+}
+
+.confirm-dialog {
+    background-color: #1f2937;
+    border: 1px solid #4B5563;
+    border-radius: 8px;
+    padding: 24px;
+    max-width: 400px;
+    width: 90%;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+}
+
+.confirm-dialog-title {
+    font-size: 18px;
+    font-weight: bold;
+    color: #ffffff;
+    margin-bottom: 16px;
+}
+
+.confirm-dialog-message {
+    font-size: 14px;
+    color: #d1d5db;
+    line-height: 1.6;
+    margin-bottom: 24px;
+    white-space: pre-wrap;
+}
+
+.confirm-dialog-buttons {
+    display: flex;
+    gap: 12px;
+    justify-content: flex-end;
+}
+
+.confirm-dialog-btn {
+    padding: 8px 20px;
+    border: none;
+    border-radius: 4px;
+    font-size: 14px;
+    cursor: pointer;
+    transition: background-color 0.3s;
+}
+
+.confirm-dialog-btn-cancel {
+    background-color: #374151;
+    color: #ffffff;
+}
+
+.confirm-dialog-btn-cancel:hover {
+    background-color: #4b5563;
+}
+
+.confirm-dialog-btn-confirm {
+    background-color: #ef5350;
+    color: #ffffff;
+}
+
+.confirm-dialog-btn-confirm:hover {
+    background-color: #f44336;
+}

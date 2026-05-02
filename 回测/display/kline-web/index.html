@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>K线绘图工具</title>
+    <link rel="stylesheet" href="css/main.css">
+    <link rel="stylesheet" href="css/toolbar.css">
+    <link rel="stylesheet" href="css/dialogs.css">
+</head>
+<body>
+    <div style="width: 100%; height: 100vh; margin: 0; padding: 0; display: flex; flex-direction: column;">
+        
+        <div class="toolbar" style="flex-shrink: 0;">
+            
+            <div style="display: flex; align-items: center; position: relative;">
+                <div style="position: relative;">
+                    <input type="text" id="stock-code-input" placeholder="输入股票代码或名称" style="padding: 4px 30px 4px 8px; background-color: #374151; color: white; border-radius: 4px; border: 1px solid #4B5563; font-size: 14px; width: 120px;">
+                    <button id="btn-clear-input" style="position: absolute; right: 6px; top: 50%; transform: translateY(-50%); background: none; border: none; color: #9ca3af; cursor: pointer; font-size: 16px; padding: 0; display: none;">×</button>
+                </div>
+                <button id="btn-search-stock" style="padding: 4px 12px; background-color: #3b82f6; color: white; border-radius: 4px; cursor: pointer; font-size: 14px; margin-left: 4px;">搜索</button>
+                <div id="search-results" style="position: absolute; top: 100%; left: 0; width: 200px; background-color: #1f2937; border: 1px solid #4B5563; border-radius: 4px; max-height: 300px; overflow: hidden; display: none; z-index: 20; margin-top: 4px;">
+                </div>
+            </div>
+            <button id="btn-5min">5分钟</button>
+            <button id="btn-15min">15分钟</button>
+            <button id="btn-30min">30分钟</button>
+            <button id="btn-60min">60分钟</button>
+            <button id="btn-daily">日线</button>
+            <button id="btn-week">周线</button>
+            <button id="btn-month">月线</button>
+            <div style="width: 20px;"></div>
+            <button id="btn-draw-tools">画线</button>
+            <button id="btn-clear">清除</button>
+            <button id="btn-refresh">刷新</button>
+            <div style="width: 10px;"></div>
+            <button id="btn-backtest-toggle" style="padding: 4px 12px; background-color: #166534; color: #22c55e; border: 1px solid #22c55e; border-radius: 4px; cursor: pointer; font-size: 13px;" title="显示/隐藏回测买卖点">回测</button>
+        </div>
+        <div style="position: relative; width: 100%; flex: 1; overflow: hidden; display: flex; flex-direction: column;">
+            <div style="position: relative; width: 100%; flex: 1; overflow: hidden;">
+                <canvas id="klineCanvas"></canvas>
+                
+                <button id="btn-macd-lines" style="position: absolute; top: 85%; left: 10px; padding: 2px 8px; font-size: 12px; z-index: 10; display: none; background-color: #1a365d;">线</button>
+                
+                <button id="btn-volume-stats" style="position: absolute; top: 95%; left: 10px; padding: 2px 8px; font-size: 12px; z-index: 10; display: none; background-color: #1a365d;">统计</button>
+                
+                <div id="stock-list-toggle" style="position: absolute; top: 50%; left: 0; transform: translateY(-50%); width: 20px; height: 40px; background-color: #374151; border-top-right-radius: 4px; border-bottom-right-radius: 4px; cursor: pointer; display: flex; align-items: center; justify-content: center; z-index: 10;">
+                    <span style="color: white; font-size: 16px; font-weight: bold;">◀</span>
+                </div>
+                
+                <div id="stock-list-container" style="position: absolute; top: 0; left: 0; width: 200px; height: 100%; background-color: #1f2937; border-right: 1px solid #677b94; overflow-y: auto; display: block; z-index: 1; opacity: 0.8; scrollbar-width: none; -ms-overflow-style: none;">
+                    <div style="padding: 8px; background-color: #374151; color: white; font-weight: bold; text-align: center;">自选股</div>
+                    <div id="stock-list-content" style="padding: 8px;">
+                    </div>
+                </div>
+            </div>
+            
+            <div id="indicator-bar" style="height: 26px; background-color: #1f2937; border-top: 1px solid #374151; display: flex; align-items: center; padding: 0 10px; flex-shrink: 0;">
+                <div id="indicator-buttons" style="display: flex; gap: 1px; margin-right: 15px;">
+                    <button id="btn-indicator-volume" class="indicator-btn" style="padding: 1px 6px; background-color: #1a365d; color: #60a5fa; border: 1px solid #374151; border-radius: 3px; cursor: pointer; font-size: 11px;">成交量</button>
+                    <button id="btn-indicator-ma" class="indicator-btn" style="padding: 1px 6px; background-color: #1a365d; color: #fbbf24; border: 1px solid #374151; border-radius: 3px; cursor: pointer; font-size: 11px;">MA</button>
+                    <button id="btn-indicator-boll" class="indicator-btn" style="padding: 1px 6px; background-color: #1f2937; color: #a855f7; border: 1px solid #374151; border-radius: 3px; cursor: pointer; font-size: 11px;">BOLL</button>
+                    <button id="btn-indicator-macd" class="indicator-btn" style="padding: 1px 6px; background-color: #1a365d; color: #a855f7; border: 1px solid #374151; border-radius: 3px; cursor: pointer; font-size: 11px;">MACD</button>
+                    <button id="btn-indicator-kdj" class="indicator-btn" style="padding: 1px 6px; background-color: #1a365d; color: #22c55e; border: 1px solid #374151; border-radius: 3px; cursor: pointer; font-size: 11px;">KDJ</button>
+                    <button id="btn-indicator-wr" class="indicator-btn" style="padding: 1px 6px; background-color: #1a365d; color: #f97316; border: 1px solid #374151; border-radius: 3px; cursor: pointer; font-size: 11px;">WR</button>
+                    <button id="btn-indicator-rsi" class="indicator-btn" style="padding: 1px 6px; background-color: #1a365d; color: #ff9800; border: 1px solid #374151; border-radius: 3px; cursor: pointer; font-size: 11px;">RSI</button>
+                </div>
+                <div id="indicator-content" style="flex: 1; display: flex; align-items: center; gap: 20px; overflow: hidden;"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/core/kline-api.js"></script>
+    <script src="js/data/stock-name-dictionary.js"></script>
+    <script src="js/data/backtest-trades.js"></script>
+    
+    <script async src="js/data/drawing-data-manager.js"></script>
+    <script async src="js/tools/rectangle-drawing.js"></script>
+    <script async src="js/tools/line-drawing.js"></script>
+    <script async src="js/tools/ray-drawing.js"></script>
+    <script async src="js/tools/horizontal-line.js"></script>
+    <script async src="js/tools/vertical-line.js"></script>
+    <script async src="js/tools/price-line.js"></script>
+    <script async src="js/tools/parallel-line.js"></script>
+    <script async src="js/tools/circle-drawing.js"></script>
+    <script async src="js/tools/text-drawing.js"></script>
+    <script async src="js/tools/arrow-drawing.js"></script>
+    <script async src="js/tools/golden-section.js"></script>
+    <script async src="js/tools/gann-line.js"></script>
+    <script async src="js/tools/measure-distance.js"></script>
+
+    <script async src="js/tools/two-point-buy.js"></script>
+    <script async src="js/tools/two-point-sell.js"></script>
+    <script async src="js/tools/three-point-buy.js"></script>
+    <script async src="js/tools/three-point-sell.js"></script>
+    <script async src="js/tools/top-bottom-kline.js"></script>
+    <script async src="js/tools/gap-detection.js"></script>
+    <script async src="js/indicators/volume-indicator.js"></script>
+    <script async src="js/indicators/macd-indicator.js"></script>
+    <script async src="js/indicators/ma-indicator.js"></script>
+    <script async src="js/indicators/boll-indicator.js"></script>
+    <script async src="js/indicators/kdj-indicator.js"></script>
+    <script async src="js/indicators/wr-indicator.js"></script>
+    <script async src="js/indicators/rsi-indicator.js"></script>
+    <script async src="js/tools/volume-statistics.js"></script>
+    <script async src="js/tools/crosshair.js"></script>
+
+    <script async src="js/overlays/backtest-overlay.js"></script>
+    
+    <script defer src="js/core/kline-chart.js"></script>
+    
+    <script defer src="js/ui/stock-search.js"></script>
+    <script defer src="js/ui/stock-list.js"></script>
+
+    <div id="confirm-dialog-overlay" class="confirm-dialog-overlay">
+        <div class="confirm-dialog">
+            <div class="confirm-dialog-title" id="confirm-dialog-title">确认操作</div>
+            <div class="confirm-dialog-message" id="confirm-dialog-message"></div>
+            <div class="confirm-dialog-buttons">
+                <button class="confirm-dialog-btn confirm-dialog-btn-cancel" id="confirm-dialog-btn-cancel">取消</button>
+                <button class="confirm-dialog-btn confirm-dialog-btn-confirm" id="confirm-dialog-btn-confirm">确定</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="context-menu" class="context-menu">
+        <div class="context-menu-item" id="context-menu-macd-settings">设置MACD参数</div>
+        <div class="context-menu-item" id="context-menu-kdj-settings">设置KDJ参数</div>
+        <div class="context-menu-item" id="context-menu-wr-settings">设置WR参数</div>
+        <div class="context-menu-item" id="context-menu-rsi-settings">设置RSI参数</div>
+        <div class="context-menu-item" id="context-menu-ma-settings">设置MA均线参数</div>
+        <div class="context-menu-item" id="context-menu-boll-settings">设置BOLL参数</div>
+        <div class="context-menu-item" id="context-menu-volume-settings">设置成交量均线</div>
+    </div>
+    
+    <div id="macd-settings-overlay" class="macd-settings-overlay">
+        <div class="macd-settings-dialog">
+            <div class="macd-settings-title">MACD参数设置</div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">短期EMA周期：</label>
+                <input type="number" id="macd-short-period" class="macd-settings-input" min="1" value="12">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">长期EMA周期：</label>
+                <input type="number" id="macd-long-period" class="macd-settings-input" min="1" value="26">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">信号线周期：</label>
+                <input type="number" id="macd-signal-period" class="macd-settings-input" min="1" value="9">
+            </div>
+            <div class="macd-settings-buttons">
+                <button class="macd-settings-btn macd-settings-btn-default" id="macd-settings-btn-default" style="background-color: #f59e0b; color: #ffffff;">默认</button>
+                <button class="macd-settings-btn macd-settings-btn-cancel" id="macd-settings-btn-cancel">取消</button>
+                <button class="macd-settings-btn macd-settings-btn-confirm" id="macd-settings-btn-confirm">确定</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="kdj-settings-overlay" class="macd-settings-overlay">
+        <div class="macd-settings-dialog">
+            <div class="macd-settings-title">KDJ参数设置</div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">KDJ周期：</label>
+                <input type="number" id="kdj-n" class="macd-settings-input" min="1" value="9">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">K线平滑周期：</label>
+                <input type="number" id="kdj-m1" class="macd-settings-input" min="1" value="3">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">D线平滑周期：</label>
+                <input type="number" id="kdj-m2" class="macd-settings-input" min="1" value="3">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">WR周期：</label>
+                <input type="number" id="kdj-wr-n" class="macd-settings-input" min="1" value="10">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">超卖区顶部：</label>
+                <input type="number" id="kdj-oversold-top" class="macd-settings-input" value="110">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">超卖线：</label>
+                <input type="number" id="kdj-oversold-line" class="macd-settings-input" value="80">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">超买线：</label>
+                <input type="number" id="kdj-overbought-line" class="macd-settings-input" value="20">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">超买区底部：</label>
+                <input type="number" id="kdj-overbought-bottom" class="macd-settings-input" value="-10">
+            </div>
+            <div class="macd-settings-buttons">
+                <button class="macd-settings-btn macd-settings-btn-default" id="kdj-settings-btn-default" style="background-color: #f59e0b; color: #ffffff;">默认</button>
+                <button class="macd-settings-btn macd-settings-btn-cancel" id="kdj-settings-btn-cancel">取消</button>
+                <button class="macd-settings-btn macd-settings-btn-confirm" id="kdj-settings-btn-confirm">确定</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="wr-settings-overlay" class="macd-settings-overlay">
+        <div class="macd-settings-dialog">
+            <div class="macd-settings-title">WR参数设置</div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">WR周期：</label>
+                <input type="number" id="wr-n" class="macd-settings-input" min="1" value="10">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">超卖区顶部：</label>
+                <input type="number" id="wr-oversold-top" class="macd-settings-input" value="100">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">超卖线：</label>
+                <input type="number" id="wr-oversold-line" class="macd-settings-input" value="80">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">超买线：</label>
+                <input type="number" id="wr-overbought-line" class="macd-settings-input" value="20">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">超买区底部：</label>
+                <input type="number" id="wr-overbought-bottom" class="macd-settings-input" value="0">
+            </div>
+            <div class="macd-settings-buttons">
+                <button class="macd-settings-btn macd-settings-btn-default" id="wr-settings-btn-default" style="background-color: #f59e0b; color: #ffffff;">默认</button>
+                <button class="macd-settings-btn macd-settings-btn-cancel" id="wr-settings-btn-cancel">取消</button>
+                <button class="macd-settings-btn macd-settings-btn-confirm" id="wr-settings-btn-confirm">确定</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="rsi-settings-overlay" class="macd-settings-overlay">
+        <div class="macd-settings-dialog">
+            <div class="macd-settings-title">RSI参数设置</div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">RSI周期：</label>
+                <input type="number" id="rsi-n" class="macd-settings-input" min="1" value="14">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">超卖区顶部：</label>
+                <input type="number" id="rsi-oversold-top" class="macd-settings-input" value="90">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">超卖线：</label>
+                <input type="number" id="rsi-oversold-line" class="macd-settings-input" value="70">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">超买线：</label>
+                <input type="number" id="rsi-overbought-line" class="macd-settings-input" value="30">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">超买区底部：</label>
+                <input type="number" id="rsi-overbought-bottom" class="macd-settings-input" value="10">
+            </div>
+            <div class="macd-settings-buttons">
+                <button class="macd-settings-btn macd-settings-btn-default" id="rsi-settings-btn-default" style="background-color: #f59e0b; color: #ffffff;">默认</button>
+                <button class="macd-settings-btn macd-settings-btn-cancel" id="rsi-settings-btn-cancel">取消</button>
+                <button class="macd-settings-btn macd-settings-btn-confirm" id="rsi-settings-btn-confirm">确定</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="ma-settings-overlay" class="macd-settings-overlay">
+        <div class="macd-settings-dialog">
+            <div class="macd-settings-title">MA均线参数设置</div>
+            <div class="macd-settings-row">
+                <input type="checkbox" id="ma-enabled-5" class="macd-settings-checkbox" checked>
+                <label class="macd-settings-label">MA5周期：</label>
+                <input type="number" id="ma-5" class="macd-settings-input" style="width: 60px; flex: none;" min="1" value="5">
+                <label class="macd-settings-label">颜色：</label>
+                <input type="color" id="ma-color-5" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#ffffff">
+            </div>
+            <div class="macd-settings-row">
+                <input type="checkbox" id="ma-enabled-10" class="macd-settings-checkbox" checked>
+                <label class="macd-settings-label">MA10周期：</label>
+                <input type="number" id="ma-10" class="macd-settings-input" style="width: 60px; flex: none;" min="1" value="10">
+                <label class="macd-settings-label">颜色：</label>
+                <input type="color" id="ma-color-10" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#fbbf24">
+            </div>
+            <div class="macd-settings-row">
+                <input type="checkbox" id="ma-enabled-20" class="macd-settings-checkbox" checked>
+                <label class="macd-settings-label">MA20周期：</label>
+                <input type="number" id="ma-20" class="macd-settings-input" style="width: 60px; flex: none;" min="1" value="20">
+                <label class="macd-settings-label">颜色：</label>
+                <input type="color" id="ma-color-20" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#a855f7">
+            </div>
+            <div class="macd-settings-row">
+                <input type="checkbox" id="ma-enabled-30" class="macd-settings-checkbox" checked>
+                <label class="macd-settings-label">MA30周期：</label>
+                <input type="number" id="ma-30" class="macd-settings-input" style="width: 60px; flex: none;" min="1" value="30">
+                <label class="macd-settings-label">颜色：</label>
+                <input type="color" id="ma-color-30" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#22c55e">
+            </div>
+            <div class="macd-settings-row">
+                <input type="checkbox" id="ma-enabled-60" class="macd-settings-checkbox" checked>
+                <label class="macd-settings-label">MA60周期：</label>
+                <input type="number" id="ma-60" class="macd-settings-input" style="width: 60px; flex: none;" min="1" value="60">
+                <label class="macd-settings-label">颜色：</label>
+                <input type="color" id="ma-color-60" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#3b82f6">
+            </div>
+            <div class="macd-settings-row">
+                <input type="checkbox" id="ma-enabled-120" class="macd-settings-checkbox" checked>
+                <label class="macd-settings-label">MA120周期：</label>
+                <input type="number" id="ma-120" class="macd-settings-input" style="width: 60px; flex: none;" min="1" value="120">
+                <label class="macd-settings-label">颜色：</label>
+                <input type="color" id="ma-color-120" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#f97316">
+            </div>
+            <div class="macd-settings-row">
+                <input type="checkbox" id="ma-enabled-250" class="macd-settings-checkbox" checked>
+                <label class="macd-settings-label">MA250周期：</label>
+                <input type="number" id="ma-250" class="macd-settings-input" style="width: 60px; flex: none;" min="1" value="250">
+                <label class="macd-settings-label">颜色：</label>
+                <input type="color" id="ma-color-250" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#ef4444">
+            </div>
+            <div class="macd-settings-buttons">
+                <button class="macd-settings-btn macd-settings-btn-default" id="ma-settings-btn-default" style="background-color: #f59e0b; color: #ffffff;">默认</button>
+                <button class="macd-settings-btn macd-settings-btn-cancel" id="ma-settings-btn-cancel">取消</button>
+                <button class="macd-settings-btn macd-settings-btn-confirm" id="ma-settings-btn-confirm">确定</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="volume-settings-overlay" class="macd-settings-overlay">
+        <div class="macd-settings-dialog">
+            <div class="macd-settings-title">成交量均线设置</div>
+            <div class="macd-settings-row">
+                <input type="checkbox" id="volume-enabled-5" class="macd-settings-checkbox">
+                <label class="macd-settings-label">MA1：</label>
+                <input type="number" id="volume-5" class="macd-settings-input" style="width: 60px; flex: none;" min="1" value="5">
+                <label class="macd-settings-label">颜色：</label>
+                <input type="color" id="volume-color-5" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#fbbf24">
+            </div>
+            <div class="macd-settings-row">
+                <input type="checkbox" id="volume-enabled-10" class="macd-settings-checkbox">
+                <label class="macd-settings-label">MA2：</label>
+                <input type="number" id="volume-10" class="macd-settings-input" style="width: 60px; flex: none;" min="1" value="10">
+                <label class="macd-settings-label">颜色：</label>
+                <input type="color" id="volume-color-10" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#60a5fa">
+            </div>
+            <div class="macd-settings-row">
+                <input type="checkbox" id="volume-enabled-20" class="macd-settings-checkbox">
+                <label class="macd-settings-label">MA3：</label>
+                <input type="number" id="volume-20" class="macd-settings-input" style="width: 60px; flex: none;" min="1" value="20">
+                <label class="macd-settings-label">颜色：</label>
+                <input type="color" id="volume-color-20" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#22c55e">
+            </div>
+            <div class="macd-settings-row">
+                <input type="checkbox" id="volume-enabled-30" class="macd-settings-checkbox">
+                <label class="macd-settings-label">MA4：</label>
+                <input type="number" id="volume-30" class="macd-settings-input" style="width: 60px; flex: none;" min="1" value="30">
+                <label class="macd-settings-label">颜色：</label>
+                <input type="color" id="volume-color-30" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#f97316">
+            </div>
+            <div class="macd-settings-buttons">
+                <button class="macd-settings-btn macd-settings-btn-default" id="volume-settings-btn-default" style="background-color: #f59e0b; color: #ffffff;">默认</button>
+                <button class="macd-settings-btn macd-settings-btn-cancel" id="volume-settings-btn-cancel">取消</button>
+                <button class="macd-settings-btn macd-settings-btn-confirm" id="volume-settings-btn-confirm">确定</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="boll-settings-overlay" class="macd-settings-overlay">
+        <div class="macd-settings-dialog">
+            <div class="macd-settings-title">BOLL参数设置</div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">周期：</label>
+                <input type="number" id="boll-period" class="macd-settings-input" style="width: 60px; flex: none;" min="1" value="20">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">标准差倍数：</label>
+                <input type="number" id="boll-std-dev" class="macd-settings-input" style="width: 60px; flex: none;" min="0.1" step="0.1" value="2">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">上轨颜色：</label>
+                <input type="color" id="boll-color-upper" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#fbbf24">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">中轨颜色：</label>
+                <input type="color" id="boll-color-mid" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#ffffff">
+            </div>
+            <div class="macd-settings-row">
+                <label class="macd-settings-label">下轨颜色：</label>
+                <input type="color" id="boll-color-lower" class="macd-settings-input" style="width: 60px; padding: 2px; flex: none;" value="#22c55e">
+            </div>
+            <div class="macd-settings-buttons">
+                <button class="macd-settings-btn macd-settings-btn-default" id="boll-settings-btn-default" style="background-color: #f59e0b; color: #ffffff;">默认</button>
+                <button class="macd-settings-btn macd-settings-btn-cancel" id="boll-settings-btn-cancel">取消</button>
+                <button class="macd-settings-btn macd-settings-btn-confirm" id="boll-settings-btn-confirm">确定</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="draw-tools-window" class="draw-tools-window" style="display: none;">
+        <div class="draw-tools-header">
+            <span class="draw-tools-title">画线工具</span>
+            <button class="draw-tools-close" id="draw-tools-close-btn">×</button>
+        </div>
+        <div class="draw-tools-quick-buttons">
+            <button id="btn-two-buy" class="draw-tool-quick-btn">两买</button>
+            <button id="btn-two-sell" class="draw-tool-quick-btn">两卖</button>
+            <button id="btn-three-buy" class="draw-tool-quick-btn">三买</button>
+            <button id="btn-three-sell" class="draw-tool-quick-btn">三卖</button>
+            <button id="btn-top-bottom" class="draw-tool-quick-btn">顶底</button>
+            <button id="btn-macd" class="draw-tool-quick-btn">量能</button>
+        </div>
+        <div class="draw-tools-content">
+            <button id="btn-line" class="draw-tool-btn" data-tool="line">线段</button>
+            <button id="btn-ray" class="draw-tool-btn" data-tool="ray">射线</button>
+            <button id="btn-horizontal" class="draw-tool-btn" data-tool="horizontal">水平线</button>
+            <button id="btn-vertical" class="draw-tool-btn" data-tool="vertical">垂直线</button>
+            <button id="btn-price" class="draw-tool-btn" data-tool="price">标价线</button>
+            <button id="btn-parallel" class="draw-tool-btn" data-tool="parallel">平行通道</button>
+            <button id="btn-rectangle" class="draw-tool-btn" data-tool="rectangle">矩形</button>
+            <button id="btn-circle" class="draw-tool-btn" data-tool="circle">圆形</button>
+            <button id="btn-text" class="draw-tool-btn" data-tool="text">文字</button>
+            <button id="btn-arrow" class="draw-tool-btn" data-tool="arrow">箭头</button>
+            <button id="btn-golden" class="draw-tool-btn" data-tool="golden">黄金分割</button>
+            <button id="btn-gann" class="draw-tool-btn" data-tool="gann">江恩线</button>
+            <button id="btn-measure" class="draw-tool-btn" data-tool="measure">测量距离</button>
+        </div>
+    </div>
+    <script>
+        // 回测买卖点开关
+        var backtestToggleBtn = document.getElementById('btn-backtest-toggle');
+        if (backtestToggleBtn) {
+            backtestToggleBtn.addEventListener('click', function() {
+                if (typeof BacktestOverlay !== 'undefined') {
+                    BacktestOverlay.enabled = !BacktestOverlay.enabled;
+                    if (BacktestOverlay.enabled) {
+                        backtestToggleBtn.style.backgroundColor = '#166534';
+                        backtestToggleBtn.style.color = '#22c55e';
+                        backtestToggleBtn.style.borderColor = '#22c55e';
+                    } else {
+                        backtestToggleBtn.style.backgroundColor = '#374151';
+                        backtestToggleBtn.style.color = '#9ca3af';
+                        backtestToggleBtn.style.borderColor = '#4B5563';
+                    }
+                    // 触发重绘
+                    if (typeof klineChartInstance !== 'undefined' && klineChartInstance) {
+                        klineChartInstance.requestRender();
+                    }
+                }
+            });
+        }
+
+        var refreshKlineBtn = document.getElementById('btn-refresh');
+        if (refreshKlineBtn) {
+            refreshKlineBtn.addEventListener('click', function() {
+                console.log('点击了刷新K线数据按钮');
+                if (typeof klineChartInstance !== 'undefined' && klineChartInstance) {
+                    klineChartInstance.loadKlineData(klineChartInstance.currentStockCode, klineChartInstance.currentPeriod);
+                } else {
+                    console.error('K线图表实例不存在');
+                }
+            });
+        } else {
+            console.error('找不到刷新K线数据按钮');
+        }
+        
+        window.onload = function() {
+            function initAll() {
+                try {
+                    if (typeof initKlineChart === 'function') {
+                        initKlineChart();
+                        console.log('K线图表初始化完成');
+                    } else {
+                        console.error('initKlineChart函数未定义');
+                    }
+                    
+                    if (typeof initStockSearch === 'function') {
+                        initStockSearch();
+                        console.log('股票搜索功能初始化完成');
+                    } else {
+                        console.error('initStockSearch函数未定义');
+                    }
+                    
+                    if (typeof initStockList === 'function') {
+                        initStockList();
+                        console.log('自选股功能初始化完成');
+                    } else {
+                        console.error('initStockList函数未定义');
+                    }
+                } catch (error) {
+                    console.error('初始化出错:', error);
+                    setTimeout(initAll, 100);
+                }
+            }
+            
+            initAll();
+        };
+    </script>
+</body>
+</html>

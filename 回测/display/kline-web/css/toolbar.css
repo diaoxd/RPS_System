@@ -1,0 +1,179 @@
+.toolbar {
+    display: flex;
+    margin: 10px;
+    flex-wrap: wrap;
+    position: relative;
+    z-index: 100;
+}
+
+button {
+    padding: 4px 12px;
+    background-color: #374151;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    transition: background-color 0.3s;
+    margin-right: 10px;
+    margin-bottom: 5px;
+}
+
+button:last-child {
+    margin-right: 0;
+}
+
+button:hover {
+    background-color: #4B5563;
+}
+
+button.active {
+    background-color: #4a90e2;
+}
+
+#btn-two-buy, #btn-three-buy {
+    background-color: #1a365d;
+}
+
+#btn-two-sell, #btn-three-sell {
+    background-color: #1a365d;
+}
+
+#btn-top-bottom {
+    background-color: #1a365d;
+}
+
+#btn-macd {
+    background-color: #1a365d;
+}
+
+#btn-rectangle {
+    background-color: #1a365d;
+}
+
+.kline-btn-active {
+    background-color: #4a90e2 !important;
+    color: #ffffff !important;
+}
+
+.indicator-btn.kline-btn-active {
+    background-color: #4a90e2 !important;
+    color: #ffffff !important;
+}
+
+#btn-draw-tools {
+    background-color: #1a365d;
+}
+
+.draw-tools-window {
+    position: fixed;
+    background-color: rgba(31, 41, 55, 0.85);
+    border: 1px solid #4B5563;
+    border-radius: 6px;
+    z-index: 1500;
+    min-width: 120px;
+    width: 150px;
+    user-select: none;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.draw-tools-header {
+    padding: 8px 12px;
+    background-color: rgba(55, 65, 81, 0.9);
+    border-bottom: 1px solid #4B5563;
+    cursor: move;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+}
+
+.draw-tools-title {
+    color: #ffffff;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+.draw-tools-close {
+    background: none;
+    border: none;
+    color: #9ca3af;
+    font-size: 20px;
+    cursor: pointer;
+    padding: 0;
+    width: 24px;
+    height: 24px;
+    line-height: 24px;
+    margin: 0;
+    margin-right: -4px;
+}
+
+.draw-tools-close:hover {
+    color: #ffffff;
+    background-color: rgba(239, 68, 68, 0.3);
+}
+
+.draw-tools-quick-buttons {
+    padding: 8px 8px 4px 8px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    border-bottom: 1px solid rgba(75, 85, 99, 0.5);
+}
+
+.draw-tool-quick-btn {
+    flex: 1;
+    padding: 6px 4px;
+    background-color: rgba(26, 54, 93, 0.9);
+    color: #ffffff;
+    border: 1px solid rgba(75, 85, 99, 0.7);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    text-align: center;
+    transition: all 0.2s;
+    margin: 0;
+}
+
+.draw-tool-quick-btn:hover {
+    background-color: rgba(30, 64, 175, 0.95);
+    border-color: rgba(107, 114, 128, 0.9);
+}
+
+.draw-tool-quick-btn.active {
+    background-color: #4a90e2;
+    border-color: #3b82f6;
+}
+
+.draw-tools-content {
+    padding: 8px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+}
+
+.draw-tool-btn {
+    padding: 6px 6px;
+    background-color: rgba(55, 65, 81, 0.8);
+    color: #d1d5db;
+    border: 1px solid #4B5563;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    text-align: center;
+    transition: all 0.2s;
+    margin: 0;
+}
+
+.draw-tool-btn:hover {
+    background-color: rgba(75, 85, 99, 0.9);
+    color: #ffffff;
+    border-color: #6B7280;
+}
+
+.draw-tool-btn.active {
+    background-color: #4a90e2;
+    color: #ffffff;
+    border-color: #3b82f6;
+}
