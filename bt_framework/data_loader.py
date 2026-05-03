@@ -73,33 +73,66 @@ def load_stock(file_path: str, turnover_df=None):
     return df, code
 
 
-def load_all_stock_data(codes, tdx_dir: str = DEFAULT_TDX_DIR, verbose=True):
+def _load_one_stock(args):
+    """线程 worker：加载单只股票"""
+    code, tdx_dir, turnover_df = args
+    fpath = resolve_file_path(code, tdx_dir)
+    if not os.path.exists(fpath):
+        return ("skip", code, f"文件不存在: {os.path.basename(fpath)}")
+    try:
+        df, real_code = load_stock(fpath, turnover_df)
+        info = f"{real_code} ({df.index[0].date()} ~ {df.index[-1].date()}, {len(df)} 日线)"
+        return ("ok", real_code, df, info)
+    except Exception as e:
+        return ("error", code, f"{os.path.basename(fpath)}: {e}")
+
+
+def load_all_stock_data(codes, tdx_dir: str = DEFAULT_TDX_DIR, verbose=True, n_jobs=1):
     """批量加载多只股票数据，返回 {code: DataFrame}"""
     print("加载换手率数据...")
     turnover_df = load_stock_turnover_rate_extdata11()
 
     result = {}
     skipped = 0
-    for code in codes:
-        fpath = resolve_file_path(code, tdx_dir)
-        if not os.path.exists(fpath):
-            if verbose:
-                print(f"  [跳过] 文件不存在: {os.path.basename(fpath)}")
-            skipped += 1
-            continue
-        try:
-            df, real_code = load_stock(fpath, turnover_df)
-            result[real_code] = df
-            if verbose:
-                print(
-                    f"  [OK] {real_code}  "
-                    f"({df.index[0].date()} ~ {df.index[-1].date()}, "
-                    f"{len(df)} 日线)"
-                )
-        except Exception as e:
-            if verbose:
-                print(f"  [跳过] {os.path.basename(fpath)}: {e}")
-            skipped += 1
+
+    if n_jobs <= 1:
+        # 单线程顺序加载
+        for code in codes:
+            status, *rest = _load_one_stock((code, tdx_dir, turnover_df))
+            if status == "ok":
+                _, df, info = rest
+                result[_] = df
+                if verbose:
+                    print(f"  [OK] {info}")
+            else:
+                if verbose:
+                    print(f"  [跳过] {rest[1]}")
+                skipped += 1
+    else:
+        # 多线程并行加载
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from threading import Lock
+
+        print_lock = Lock()
+        tasks = [(code, tdx_dir, turnover_df) for code in codes]
+
+        with ThreadPoolExecutor(max_workers=n_jobs) as executor:
+            futures = {executor.submit(_load_one_stock, t): t for t in tasks}
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                status, *rest = future.result()
+                if status == "ok":
+                    real_code, df, info = rest
+                    result[real_code] = df
+                    if verbose:
+                        with print_lock:
+                            print(f"  [{done_count}/{len(codes)}] [OK] {info}")
+                else:
+                    if verbose:
+                        with print_lock:
+                            print(f"  [{done_count}/{len(codes)}] [跳过] {rest[1]}")
+                    skipped += 1
 
     print(f"  成功加载: {len(result)} 只, 跳过: {skipped} 只")
     return result

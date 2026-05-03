@@ -3,12 +3,36 @@
 回测引擎 —— 风控 + 交易执行 + 统计输出。
 """
 
+import os
+import sys
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import pandas as pd
 
 from .data_loader import load_all_stock_data
+
+
+def _compute_single_stock(args):
+    """
+    多进程 worker：对单只股票执行策略计算。
+    参数: (code, df_dict, strategy)
+    返回: (code, df_out)
+    """
+    code, df_dict, strategy = args
+
+    # Windows spawn 模式下需恢复项目路径
+    _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _PROJECT_ROOT)
+
+    df = pd.DataFrame(df_dict)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df.set_index("date", inplace=True)
+
+    df_out = strategy.compute(df.copy())
+    return code, df_out
 
 
 # ============================================================
@@ -72,7 +96,7 @@ class BacktestResult:
 class BacktestEngine:
     """回测引擎"""
 
-    def __init__(self, verbose=True):
+    def __init__(self, verbose=True, n_jobs=1):
         # ----- 用户配置 -----
         self.stock_codes = []
         self.strategy = None
@@ -81,6 +105,7 @@ class BacktestEngine:
         self._date_start = None  # 回测起始日期（可选）
         self._date_end = None    # 回测结束日期（可选）
         self._verbose = verbose
+        self._n_jobs = n_jobs    # 多进程并行数（1=单进程）
 
         # ----- 资金 & 风控参数 -----
         self.risk = {
@@ -90,6 +115,7 @@ class BacktestEngine:
             "trailing_stop": None,  # 移动止损（从最高点回落 %）
             "stop_loss": None,  # 固定止损（亏损 %）
             "take_profit": None,  # 固定止盈（盈利 %）
+            "profit_protection": False,  # 分层利润保护（基于PROT_ADJ）
         }
 
         # ----- 运行时状态 -----
@@ -139,6 +165,11 @@ class BacktestEngine:
     def set_take_profit(self, pct: float):
         """固定止盈，如 0.15 = 盈利 15% 卖出"""
         self.risk["take_profit"] = pct
+        return self
+
+    def set_profit_protection(self, enable=True):
+        """启用分层利润保护（需策略输出 prot_adj 列）"""
+        self.risk["profit_protection"] = enable
         return self
 
     def set_block_pool(self, block_pool, tags=None):
@@ -198,26 +229,59 @@ class BacktestEngine:
 
         print("加载股票数据...")
         self.data = load_all_stock_data(
-            self.stock_codes, self.tdx_dir, verbose=self._verbose
+            self.stock_codes, self.tdx_dir, verbose=self._verbose,
+            n_jobs=self._n_jobs
         )
         if not self.data:
             raise RuntimeError("没有成功加载任何股票数据")
 
     def _compute_signals(self):
-        """对每只股票调用策略的 compute()"""
+        """对每只股票调用策略的 compute()，支持多进程并行"""
         if self._verbose:
-            print("\n策略计算信号...")
+            print(f"\n策略计算信号...  (并行进程: {self._n_jobs})")
+
+        if self._n_jobs > 1:
+            self._compute_signals_parallel()
+        else:
+            self._compute_signals_sequential()
+
+        if self._verbose:
+            total_signals = sum(
+                (df["signal"] != 0).sum() for df in self.signals.values()
+            )
+            print(f"  [OK] 共 {len(self.signals)} 只股票, {total_signals} 条信号")
+
+    def _compute_signals_sequential(self):
+        """单进程顺序计算"""
         for code, df in self.data.items():
             df_out = self.strategy.compute(df.copy())
-            required = {"signal", "price"}
-            missing = required - set(df_out.columns)
-            if missing:
-                raise ValueError(
-                    f"策略 compute() 返回缺少列: {missing}"
-                )
-            self.signals[code] = df_out
-        if self._verbose:
-            print(f"  [OK] 共 {len(self.signals)} 只股票")
+            self._validate_and_store(code, df_out)
+
+    def _compute_signals_parallel(self):
+        """多进程并行计算"""
+        from concurrent.futures import ProcessPoolExecutor
+
+        # 将 DataFrame 转为 dict 以便序列化
+        tasks = []
+        for code, df in self.data.items():
+            df_dict = df.reset_index().to_dict("list")
+            tasks.append((code, df_dict, self.strategy))
+
+        with ProcessPoolExecutor(max_workers=self._n_jobs) as executor:
+            futures = [executor.submit(_compute_single_stock, t) for t in tasks]
+            for future in futures:
+                code, df_out = future.result()
+                self._validate_and_store(code, df_out)
+
+    def _validate_and_store(self, code, df_out):
+        """验证策略输出并存储"""
+        required = {"signal", "price"}
+        missing = required - set(df_out.columns)
+        if missing:
+            raise ValueError(
+                f"策略 compute() 返回缺少列: {missing} (股票: {code})"
+            )
+        self.signals[code] = df_out
 
     def _run_loop(self):
         """逐日回测主循环"""
@@ -282,11 +346,13 @@ class BacktestEngine:
                     if pool_stocks_today is None or code in pool_stocks_today:
                         self._buy(code, row, date)
 
-            # ---- 第三遍：更新持仓股票的最高价（用于移动止损下一日） ----
+            # ---- 第三遍：更新持仓股票的最高价和最大浮盈（用于下一日风控） ----
             for code, pos in self.positions.items():
                 if date in self.signals[code].index:
                     row = self.signals[code].loc[date]
                     pos["high_water"] = max(pos["high_water"], row["High"])
+                    high_profit = (row["High"] - pos["avg_cost"]) / pos["avg_cost"]
+                    pos["max_profit"] = max(pos.get("max_profit", 0.0), high_profit)
 
             # ---- 记录每日总资产 ----
             self._record_equity(date)
@@ -304,7 +370,7 @@ class BacktestEngine:
 
     def _check_stops(self, code, row, date) -> bool:
         """
-        检查是否触发止损/止盈。
+        检查是否触发止损/止盈/分层利润保护。
         返回 True 表示已卖出。
         """
         pos = self.positions.get(code)
@@ -313,6 +379,12 @@ class BacktestEngine:
 
         high_water = pos["high_water"]
         close_price = row["Close"]
+        avg_cost = pos["avg_cost"]
+        current_profit = (close_price - avg_cost) / avg_cost
+
+        # 更新最大浮盈（基于收盘价）
+        pos["max_profit"] = max(pos.get("max_profit", current_profit), current_profit)
+        max_profit = pos["max_profit"]
 
         # 移动止损：从最高点回落 X%
         if self.risk["trailing_stop"] is not None:
@@ -324,17 +396,43 @@ class BacktestEngine:
 
         # 固定止损：亏损 X%
         if self.risk["stop_loss"] is not None:
-            loss_pct = (close_price - pos["avg_cost"]) / pos["avg_cost"]
+            loss_pct = (close_price - avg_cost) / avg_cost
             if loss_pct <= -self.risk["stop_loss"]:
                 self._sell(code, row, date, reason="stop_loss")
                 return True
 
         # 固定止盈：盈利 X%
         if self.risk["take_profit"] is not None:
-            profit_pct = (close_price - pos["avg_cost"]) / pos["avg_cost"]
+            profit_pct = (close_price - avg_cost) / avg_cost
             if profit_pct >= self.risk["take_profit"]:
                 self._sell(code, row, date, reason="take_profit")
                 return True
+
+        # 分层利润保护（基于PROT_ADJ移动止盈线）
+        if self.risk.get("profit_protection"):
+            prot_adj = row.get("prot_adj")
+            if prot_adj is not None and not pd.isna(prot_adj) and prot_adj > 0:
+                prot_adj_profit = (prot_adj - avg_cost) / avg_cost
+                low_price = row["Low"]
+
+                # 规则1: 浮盈曾≥10%, 盘中最低价跌破10%利润线, 但未破PROT_ADJ → 保10%
+                if max_profit >= 0.10:
+                    low_profit = (low_price - avg_cost) / avg_cost
+                    if low_profit < 0.10 and low_price > prot_adj:
+                        self._sell(code, row, date, reason="profit_lock_10pct")
+                        return True
+
+                # 规则2: 浮盈曾≥10%, PROT_ADJ已高于10%利润线, 收盘跌破PROT_ADJ → 更大获利
+                if max_profit >= 0.10 and prot_adj_profit > 0.10:
+                    if close_price < prot_adj:
+                        self._sell(code, row, date, reason="prot_adj_10pct")
+                        return True
+
+                # 规则3: 浮盈曾≥5%, PROT_ADJ利润不足3%, 收盘利润≤3% → 保3%
+                if max_profit >= 0.05 and prot_adj_profit < 0.03:
+                    if current_profit <= 0.03:
+                        self._sell(code, row, date, reason="profit_lock_3pct")
+                        return True
 
         return False
 
@@ -390,6 +488,7 @@ class BacktestEngine:
             "shares": shares,
             "avg_cost": price,
             "high_water": price,  # 初始最高价 = 买入价
+            "max_profit": 0.0,  # 最大浮盈比例
             "buy_date": date,
         }
 

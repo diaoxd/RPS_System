@@ -1799,6 +1799,39 @@ KlineChart.prototype.requestRender = function() {
 KlineChart.prototype.renderAll = function() {
     try {
         this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+
+        // ── 右上角：股票代码 + 名称 ──
+        var stockCode = this.currentStockCode;
+        if (stockCode) {
+            var pureCode = stockCode.replace(/^(sh|sz|bj)/i, '');
+            var stockName = '';
+            if (typeof stockNameDictionary !== 'undefined') {
+                // 字典 key 带前缀如 sh000001
+                stockName = stockNameDictionary[stockCode] || stockNameDictionary[pureCode] || '';
+            }
+            this.ctx.save();
+            this.ctx.font = 'bold 13px sans-serif';
+            this.ctx.textAlign = 'right';
+            this.ctx.textBaseline = 'top';
+            var displayText = pureCode + (stockName ? ' ' + stockName : '');
+            var textW = this.ctx.measureText(displayText).width;
+            var bx = this.canvas.width - 12;
+            var by = 10;
+            // 半透明背景
+            this.ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+            this.ctx.fillRect(bx - textW - 12, by - 2, textW + 24, 24);
+            // 代码（蓝色）
+            this.ctx.fillStyle = '#60a5fa';
+            this.ctx.fillText(pureCode, bx, by + 2);
+            // 名称（白色）
+            if (stockName) {
+                var codeW = this.ctx.measureText(pureCode + ' ').width;
+                this.ctx.fillStyle = '#ffffff';
+                this.ctx.fillText(stockName, bx - textW + codeW, by + 2);
+            }
+            this.ctx.restore();
+        }
+
         this.drawCandles();
         if (this.twoPointBuy && this.twoPointBuy.allData && this.twoPointBuy.allData.length > 0) {
             this.twoPointBuy.renderAll(this.ctx);
@@ -1837,6 +1870,10 @@ KlineChart.prototype.renderAll = function() {
         // 渲染回测买卖点叠加层
         if (typeof BacktestOverlay !== 'undefined' && BacktestOverlay.chart) {
             BacktestOverlay.render(this.ctx);
+            // 渲染回测悬浮提示（板块RPS信息）
+            if (BacktestOverlay.renderTooltip) {
+                BacktestOverlay.renderTooltip(this.ctx);
+            }
         }
         // 渲染矩形
         if (this.rectangleDrawing) {
@@ -2021,31 +2058,92 @@ KlineChart.prototype.jumpToToday = function() {
     if (!this.candles || this.candles.length === 0) {
         return;
     }
-    
+
     // 计算缩放比例，让最后120根K线填满窗口
     var displayCount = 120;
     this.scale = this.candles.length / displayCount;
-    
+
     // 计算偏移量，显示最后120根K线
     var width = this.canvas.width;
     var rightPadding = 45;
     var availableWidth = width - rightPadding;
     var baseCandleWidth = availableWidth / this.candles.length;
     var candleWidth = baseCandleWidth * this.scale;
-    
+
     // 计算K线实体宽度
     var baseBodyWidth = 6;
     var maxBodyWidthRatio = 0.8;
     var maxBodyWidth = candleWidth * maxBodyWidthRatio;
     var bodyWidth = Math.min(baseBodyWidth * this.scale, maxBodyWidth);
-    
+
     // 向左偏移，让最后120根K线显示在窗口中，最后一根K线实体右边缘与现价框左边缘之间留出2px间距
     this.offsetX = -(this.candles.length - displayCount) * candleWidth - bodyWidth / 2 - 2;
-    
+
     console.log('跳回今日K线：缩放=' + this.scale.toFixed(2) + '，偏移=' + this.offsetX.toFixed(2));
-    
+
     // 重绘
     this.requestRender();
+};
+
+// 跳转到首个买卖点（如果有回测数据），否则跳回今日
+KlineChart.prototype.jumpToFirstTrade = function() {
+    if (!this.candles || this.candles.length === 0) return false;
+    if (this.currentPeriod !== 'daily') return false;
+    if (typeof BACKTEST_TRADES === 'undefined') return false;
+
+    var stockCode = this.currentStockCode;
+    if (!stockCode) return false;
+
+    // 去掉 sh/sz/bj 前缀
+    var pureCode = stockCode.replace(/^(sh|sz|bj)/i, '');
+    var stockData = BACKTEST_TRADES[pureCode];
+    if (!stockData || !stockData.daily || stockData.daily.length === 0) return false;
+
+    // 找到第一个买入点的日期
+    var trades = stockData.daily;
+    var firstTradeDate = null;
+    for (var i = 0; i < trades.length; i++) {
+        if (trades[i].type === 'buy') {
+            firstTradeDate = trades[i].date;
+            break;
+        }
+    }
+    if (!firstTradeDate) return false;
+
+    // 找到该日期对应的K线索引
+    var targetIdx = -1;
+    for (var i = 0; i < this.candles.length; i++) {
+        var d = this.candles[i].day || this.candles[i].date || '';
+        var key = String(d).trim();
+        if (key.indexOf('-') === -1 && key.length === 8) {
+            key = key.substring(0, 4) + '-' + key.substring(4, 6) + '-' + key.substring(6, 8);
+        }
+        if (key === firstTradeDate) {
+            targetIdx = i;
+            break;
+        }
+    }
+    if (targetIdx < 0) return false;
+
+    // 设置缩放（同 jumpToToday：显示约120根）
+    var displayCount = 120;
+    this.scale = this.candles.length / displayCount;
+
+    var width = this.canvas.width;
+    var rightPadding = 45;
+    var availableWidth = width - rightPadding;
+    var baseCandleWidth = availableWidth / this.candles.length;
+    var candleWidth = baseCandleWidth * this.scale;
+
+    // 让目标K线居中显示
+    this.offsetX = this.canvas.width / 2 - targetIdx * candleWidth - candleWidth / 2;
+    // 调用边界限制
+    this.clampOffsetX();
+
+    console.log('定位首个买卖点：' + pureCode + ' ' + firstTradeDate + ' (索引' + targetIdx + ')，缩放=' + this.scale.toFixed(2) + '，偏移=' + this.offsetX.toFixed(2));
+
+    this.requestRender();
+    return true;
 };
 
 // 数据加载后的处理逻辑
@@ -2066,8 +2164,10 @@ KlineChart.prototype.processKlineData = function(stockCode, period, klineData, d
         console.log('日线前收盘价：' + dailyPrevClose);
     }
     
-    // 跳回今日K线
-    self.jumpToToday();
+    // 有回测买卖点则定位到首个买卖点，否则跳回今日K线
+    if (!self.jumpToFirstTrade()) {
+        self.jumpToToday();
+    }
     
     // 加载两点买入数据
     if (self.twoPointBuy) {
@@ -5340,10 +5440,8 @@ KlineChart.prototype.drawCandles = function() {
             );
         }
 
-        // 绘制光标悬浮K线信息（始终显示，无需开关）
-        if (this.isMouseOverCanvas && !this.isContextMenuShowing) {
-            this.drawCandleHoverInfo(this.ctx, candleWidth, this.offsetX, mainChartHeight);
-        }
+        // （左上角静态 OHLC 面板已移除，改用十字光标信息框显示）
+
     }
 
     // 绘制光标所在K线的OHLC信息面板（始终显示，无需双击激活）
@@ -5378,6 +5476,7 @@ KlineChart.prototype.drawCandles = function() {
         }
 
         var dateStr = candle.date || candle.day || '';
+
         var lines = [
             dateStr,
             'O ' + (candle.open != null ? candle.open.toFixed(2) : '--'),

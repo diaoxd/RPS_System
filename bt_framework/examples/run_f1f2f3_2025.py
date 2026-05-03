@@ -52,6 +52,9 @@ COMMISSION = 0.00075           # 双边千分之1.5 (每边0.075%)
 MAX_PER_STOCK = 0.1            # 单只最大仓位10%
 STOP_LOSS = 0.10               # 10%固定止损
 SELL_MODE = "prot_adj"         # "ma5" = 跌破MA5, "prot_adj" = PROT_ADJ移动止盈
+USE_FLASH_CRASH = False        # 关闭四天跌5%急跌（由分层利润保护替代）
+PROFIT_PROTECTION = True       # 启用分层利润保护（基于PROT_ADJ）
+N_JOBS = 8                     # 多进程并行数
 
 print("=" * 60)
 print("F1+F2+F3 策略 — 2025年核心池回测")
@@ -61,6 +64,9 @@ print(f"初始资金: {INITIAL_CASH:,.0f}")
 print(f"手续费率: {COMMISSION:.4f} ({COMMISSION*2*100:.2f}% 双边)")
 print(f"止损线:   {STOP_LOSS*100:.0f}%")
 print(f"单票上限: {MAX_PER_STOCK*100:.0f}%")
+print(f"分层利润保护: {'开启' if PROFIT_PROTECTION else '关闭'}")
+print(f"急跌止盈:     {'开启' if USE_FLASH_CRASH else '关闭'}")
+print(f"并行进程:     {N_JOBS}")
 print()
 
 # ============================================================
@@ -95,17 +101,19 @@ strategy = F1F2F3Strategy(
     zt_lookback=20,
     zt_threshold=1.098,
     sell_mode=SELL_MODE,
+    use_flash_crash=USE_FLASH_CRASH,
 )
 print(f"  策略: {strategy.name}")
 print(f"  参数: {strategy.params}")
 
-engine = BacktestEngine(verbose=True)
+engine = BacktestEngine(verbose=True, n_jobs=N_JOBS)
 engine.set_block_pool(pool, tags=POOL_TAGS)
 engine.set_strategy(strategy)
 engine.set_cash(INITIAL_CASH)
 engine.set_commission(COMMISSION)
 engine.set_max_per_stock(MAX_PER_STOCK)
 engine.set_stop_loss(STOP_LOSS)
+engine.set_profit_protection(PROFIT_PROTECTION)
 engine.set_date_range(START_DATE, END_DATE)
 
 # ============================================================
@@ -262,7 +270,7 @@ def _export_to_excel(result, closed_trades, open_positions, sell_mode, start_dat
             "股票代码": b.code, "买入日期": b.date, "买入价": round(b.price, 2),
             "卖出日期": s.date, "卖出价": round(s.price, 2),
             "持仓天数": s.hold_days, "收益率%": round(ret_pct, 2),
-            "盈亏金额": round(s.pnl, 2), "卖出原因": s.reason,
+            "盈亏金额": round(s.pnl, 2), "买入原因": getattr(b, "reason", "均线多头+涨停基因+5日线上") or "均线多头+涨停基因+5日线上", "卖出原因": s.reason,
         })
     df_trades = pd.DataFrame(trade_rows)
 

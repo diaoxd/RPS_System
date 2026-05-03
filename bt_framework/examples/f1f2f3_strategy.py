@@ -34,6 +34,7 @@ class F1F2F3Strategy(BaseStrategy):
         zt_lookback=20,
         zt_threshold=1.098,
         sell_mode="ma5",  # "ma5" = 跌破MA5, "prot_adj" = PROT_ADJ移动止盈
+        use_flash_crash=True,  # 是否启用四天跌5%急跌止盈（profit_protection启用时建议关闭）
     ):
         self._ms = ma_short
         self._mm = ma_mid
@@ -42,6 +43,7 @@ class F1F2F3Strategy(BaseStrategy):
         self._zl = zt_lookback
         self._zt = zt_threshold
         self._sell_mode = sell_mode
+        self._use_flash_crash = use_flash_crash
 
     @property
     def name(self):
@@ -101,18 +103,22 @@ class F1F2F3Strategy(BaseStrategy):
         # 去重：只在信号从 False→True 的当天买入
         buy = qualified & ~REF(qualified.astype(float), 1).astype(bool)
 
+        # ---- 始终计算 PROT_ADJ（供引擎分层利润保护） ----
+        from bt_framework.examples.moving_stop_profit import compute_moving_stop
+        lines = compute_moving_stop(df)
+        prot_adj = lines["prot_adj"].values
+
         # ---- 卖出信号 ----
         if self._sell_mode == "prot_adj":
-            from bt_framework.examples.moving_stop_profit import compute_moving_stop
-            lines = compute_moving_stop(df)
-            prot_adj = lines["prot_adj"].values
-            drop5_stop = lines["drop5_stop"].values
             L = df["Low"].values.astype(float)
             sell_trailing = (C < prot_adj) & (REF(C, 1) >= REF(prot_adj, 1))
-            sell_flash = (L <= drop5_stop) & ~np.isnan(drop5_stop)
-            sell = sell_trailing | sell_flash
+            if self._use_flash_crash:
+                drop5_stop = lines["drop5_stop"].values
+                sell_flash = (L <= drop5_stop) & ~np.isnan(drop5_stop)
+                sell = sell_trailing | sell_flash
+            else:
+                sell = sell_trailing
         else:
-            prot_adj = np.full_like(C, np.nan)
             sell = (C < MA5) & (REF(C, 1) >= REF(MA5, 1))
 
         # ---- 写入 DataFrame ----
@@ -120,9 +126,8 @@ class F1F2F3Strategy(BaseStrategy):
         df.loc[pd.Series(buy.astype(bool), index=df.index), "signal"] = 1
         df.loc[pd.Series(sell, index=df.index), "signal"] = -1
         df["price"] = C
+        df["prot_adj"] = prot_adj  # 输出PROT_ADJ供引擎分层利润保护
 
         # 过滤掉均线未计算完成的早期数据
-        valid = ~np.isnan(MA60)
-        if self._sell_mode == "prot_adj":
-            valid = valid & ~np.isnan(prot_adj)
+        valid = ~np.isnan(MA60) & ~np.isnan(prot_adj)
         return df.loc[valid]

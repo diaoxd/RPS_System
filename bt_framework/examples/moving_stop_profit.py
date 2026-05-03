@@ -280,5 +280,7 @@ class GoldenCrossTrailingStopStrategy(BaseStrategy):
         for col in ["protected", "rangli_line", "prot_adj", "drop5_stop", "drop5_final"]:
             df[col] = lines[col].values
 
+        df["prot_adj"] = prot_adj  # 确保prot_adj列存在（供引擎分层利润保护）
+
         valid = ~np.isnan(ma_l) & ~np.isnan(prot_adj)
         return df.loc[valid]
