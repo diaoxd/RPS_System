@@ -15,20 +15,32 @@ import pandas as pd
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _PROJECT_ROOT)
 
-EXCEL_PATH = os.path.join(_PROJECT_ROOT, "reports", "引擎回测_prot_adj_2025-01-02_2025-12-31.xlsx")
+EXCEL_PATH = os.path.join(_PROJECT_ROOT, "reports", "引擎回测_prot_adj_2025-01-02_2026-04-30.xlsx")
 OUTPUT_JS = os.path.join(_PROJECT_ROOT, "回测", "display", "kline-web", "js", "data", "backtest-trades.js")
 OUTPUT_JSON = os.path.join(_PROJECT_ROOT, "回测", "display", "kline-web", "js", "data", "backtest-trades.json")
 
 # 原因编码 → 中文描述映射
 BUY_REASON_MAP = {
-    "F1+F2+F3": "均线多头+涨停基因+5日线上",
+    "F1+F2+F3": "均线趋势+涨停基因+CROSS(C,MA5)",
+    "均线多头+涨停基因+5日线上": "均线趋势+涨停基因+CROSS(C,MA5)",
+    "回调上穿MA5+涨停箱体支撑": "回调上穿MA5+涨停箱体支撑",
 }
 
 BUY_REASON_DETAIL = {
     "F1+F2+F3": {
-        "F1 均线多头": "MA5>MA10>MA20>MA60，四线斜率向上",
+        "F1 均线趋势": "MA60斜率>0, MA20/MA30至少一个>0, MA5斜率>=0",
         "F2 涨停基因": "近20日内有过涨停（涨幅≥9.8%）",
-        "F3 5日线上": "收盘价 > MA5 均线",
+        "F3 CROSS(C,MA5)": "收盘价上穿MA5，MA5斜率确认，允许次日延迟买入",
+    },
+    "均线多头+涨停基因+5日线上": {
+        "F1 均线趋势": "MA60斜率>0, MA20/MA30至少一个>0, MA5斜率>=0",
+        "F2 涨停基因": "近20日内有过涨停（涨幅≥9.8%）",
+        "F3 CROSS(C,MA5)": "收盘价上穿MA5，MA5斜率确认，允许次日延迟买入",
+    },
+    "回调上穿MA5+涨停箱体支撑": {
+        "均线支撑": "MA20或MA30斜率向上，中期趋势确立",
+        "回调上穿": "收盘价由下向上突破MA5，且MA5斜率非负，回调结束信号",
+        "箱体区间": "买入价位于近120日最大涨停箱体区间内",
     },
 }
 
@@ -81,7 +93,15 @@ def main():
 
         buy_reason = _map_reason(raw_buy_reason, BUY_REASON_MAP)
         sell_reason = _map_reason(raw_sell_reason, SELL_REASON_MAP)
-        buy_detail = BUY_REASON_DETAIL.get(raw_buy_reason, {})
+        # 优先读取Excel中的动态详解，否则用静态映射
+        raw_buy_detail = row.get("买入原因详解", "")
+        if raw_buy_detail and str(raw_buy_detail).startswith("{"):
+            try:
+                buy_detail = json.loads(str(raw_buy_detail))
+            except Exception:
+                buy_detail = BUY_REASON_DETAIL.get(raw_buy_reason, {})
+        else:
+            buy_detail = BUY_REASON_DETAIL.get(raw_buy_reason, {})
         sell_detail = SELL_REASON_DETAIL.get(raw_sell_reason, raw_sell_reason)
 
         if code not in trades_by_code:
@@ -115,7 +135,8 @@ def main():
     # 导出 JS 文件（直接赋值到全局变量）
     js_content = (
         "// 自动生成，请勿手动编辑\n"
-        "// 来源: 引擎回测_prot_adj_2025-01-02_2025-12-31.xlsx\n"
+        "// 来源: 引擎回测_prot_adj_2025-01-02_2026-04-30.xlsx\n"
+        f"// 策略: F1(MA60↑+MA20/30↑+MA5≥0)+F2(涨停20日)+F3(CROSS(C,MA5)+次日补买)+PROT_ADJ止盈+分层利润保护\n"
         f"// 交易: {len(df)} 笔, 股票: {len(trades_by_code)} 只\n"
         f"// 原因映射: 买入={list(BUY_REASON_MAP.values())}, 卖出={list(SELL_REASON_MAP.values())}\n"
         "var BACKTEST_TRADES = " + json.dumps(trades_by_code, ensure_ascii=False, indent=2) + ";\n"

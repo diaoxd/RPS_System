@@ -1867,12 +1867,22 @@ KlineChart.prototype.renderAll = function() {
             }
         }
         this.drawSavedLines();
+        // 渲染涨停箱体叠加层（在买卖点之下）
+        if (typeof LimitUpBoxOverlay !== 'undefined' && LimitUpBoxOverlay.chart) {
+            LimitUpBoxOverlay.render(this.ctx);
+        }
         // 渲染回测买卖点叠加层
         if (typeof BacktestOverlay !== 'undefined' && BacktestOverlay.chart) {
             BacktestOverlay.render(this.ctx);
             // 渲染回测悬浮提示（板块RPS信息）
             if (BacktestOverlay.renderTooltip) {
                 BacktestOverlay.renderTooltip(this.ctx);
+            }
+        }
+        // 渲染箱体悬浮提示
+        if (typeof LimitUpBoxOverlay !== 'undefined' && LimitUpBoxOverlay.chart) {
+            if (LimitUpBoxOverlay.renderTooltip) {
+                LimitUpBoxOverlay.renderTooltip(this.ctx);
             }
         }
         // 渲染矩形
@@ -6447,7 +6457,11 @@ function initKlineChart() {
         if (typeof BacktestOverlay !== 'undefined' && BacktestOverlay.init) {
             BacktestOverlay.init(klineChartInstance);
         }
-        
+        // 初始化涨停箱体叠加层
+        if (typeof LimitUpBoxOverlay !== 'undefined' && LimitUpBoxOverlay.init) {
+            LimitUpBoxOverlay.init(klineChartInstance);
+        }
+
         // 检查自选股列表，加载第一个股票或上证指数
         var stockList = JSON.parse(localStorage.getItem('stockList')) || [];
         if (stockList.length > 0) {

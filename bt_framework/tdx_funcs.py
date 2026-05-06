@@ -80,6 +80,33 @@ def IF(cond, true_val, false_val):
     return pd.Series(np.where(cond, true_val, false_val), index=cond.index)
 
 
+def HHVBARS(series, n):
+    """
+    HHVBARS(X, N) → N 周期内最高值距今的周期数。
+    当前 bar 为最高时返回 0，有多个相同最高值时取最近的。
+    忽略 NaN。
+    """
+    vals = series.values.astype(float)
+    n_int = int(n)
+    result = np.full(len(vals), 0)
+    for i in range(len(vals)):
+        start = max(0, i - n_int + 1)
+        window = vals[start:i + 1]
+        # 忽略 NaN 取最大值；若全 NaN 则返回 0
+        finite = window[~np.isnan(window)]
+        if len(finite) == 0:
+            result[i] = 0
+            continue
+        max_val = np.max(finite)
+        dist = 0
+        for j in range(i, start - 1, -1):
+            if not np.isnan(vals[j]) and vals[j] == max_val:
+                dist = i - j
+                break
+        result[i] = dist
+    return pd.Series(result, index=series.index, dtype=int)
+
+
 def CROSS(a, b):
     """CROSS(A, B) → A 上穿 B（A 从 ≤B 变成 >B）"""
     return (a > b) & (a.shift(1) <= b.shift(1))

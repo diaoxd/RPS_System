@@ -19,6 +19,11 @@ from Tdx_ext_data_reader import load_stock_turnover_rate_extdata11
 # 通达信日线导出目录
 DEFAULT_TDX_DIR = r"C:\tool\Tdx MPV V1.24++\T0002\export\1day"
 
+# pickle 缓存路径（一次性加载，比逐文件读取快 10x+）
+_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_PICKLE_PATH = os.path.join(_CACHE_DIR, "stock_daily.pkl")
+_POOL_SNAPSHOT_PATH = os.path.join(_CACHE_DIR, "pool_daily_snapshots.pkl")
+
 
 def resolve_file_path(code: str, tdx_dir: str = DEFAULT_TDX_DIR):
     """将股票代码转换为通达信文件路径"""
@@ -87,11 +92,64 @@ def _load_one_stock(args):
         return ("error", code, f"{os.path.basename(fpath)}: {e}")
 
 
+def load_from_pickle(codes, turnover_df=None):
+    """
+    从 pickle 缓存加载指定股票数据，返回 {code: DataFrame}。
+    比逐文件读取快 10x+，I/O 从 5520 次降到 1 次。
+    """
+    if not os.path.exists(_PICKLE_PATH):
+        raise FileNotFoundError(
+            f"pickle 缓存不存在: {_PICKLE_PATH}\n"
+            f"请先运行: python bt_framework/build_parquet_cache.py"
+        )
+
+    full_df = pd.read_pickle(_PICKLE_PATH)
+
+    # 过滤到指定股票（pickle 存的是 "SH600519" 格式，池返回"600519"）
+    code_set = set(codes)
+    df = full_df[full_df["code"].str[-6:].isin(code_set)].copy()
+    del full_df  # 释放内存
+
+    if df.empty:
+        return {}
+
+    df["date"] = pd.to_datetime(df["date"])
+
+    # 按 code 拆分（key 统一为6位数字代码）
+    result = {}
+    for code, group in df.groupby("code"):
+        short_code = code[-6:]
+        group = group.sort_values("date").set_index("date")
+        group["prev_close"] = group["Close"].shift(1)
+
+        # 合并换手率
+        if turnover_df is not None and short_code in turnover_df["code"].values:
+            tdf = turnover_df[turnover_df["code"] == short_code][["date", "turnover_rate"]].copy()
+            tdf["date"] = pd.to_datetime(tdf["date"])
+            tdf = tdf.set_index("date")
+            group = group.merge(tdf, left_index=True, right_index=True, how="left")
+            group["turnover_rate"] = group["turnover_rate"].fillna(0.0)
+        else:
+            group["turnover_rate"] = 0.0
+
+        result[short_code] = group
+
+    return result
+
+
 def load_all_stock_data(codes, tdx_dir: str = DEFAULT_TDX_DIR, verbose=True, n_jobs=1):
-    """批量加载多只股票数据，返回 {code: DataFrame}"""
+    """批量加载多只股票数据，返回 {code: DataFrame}。优先使用 pickle 缓存。"""
     print("加载换手率数据...")
     turnover_df = load_stock_turnover_rate_extdata11()
 
+    # 优先使用 pickle 缓存
+    if os.path.exists(_PICKLE_PATH):
+        print(f"从 pickle 缓存加载 ({os.path.getsize(_PICKLE_PATH)/1024/1024:.0f} MB)...")
+        result = load_from_pickle(codes, turnover_df)
+        print(f"  成功加载: {len(result)} 只, 跳过: {len(codes) - len(result)} 只")
+        return result
+
+    # fallback：逐文件加载
     result = {}
     skipped = 0
 

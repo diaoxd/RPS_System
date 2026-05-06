@@ -45,7 +45,7 @@ def load_sqlserver_config():
 # 回测参数
 # ============================================================
 START_DATE = "2025-01-02"      # 2025年第一个交易日
-END_DATE = "2025-12-31"        # 2025年最后一个交易日
+END_DATE = "2026-04-30"        # 回测到2026年4月底
 POOL_TAGS = ["核心", "新兴", "趋势"]  # 买入必须来自三池之一
 INITIAL_CASH = 1_000_000       # 初始资金100万
 COMMISSION = 0.00075           # 双边千分之1.5 (每边0.075%)
@@ -54,10 +54,10 @@ STOP_LOSS = 0.10               # 10%固定止损
 SELL_MODE = "prot_adj"         # "ma5" = 跌破MA5, "prot_adj" = PROT_ADJ移动止盈
 USE_FLASH_CRASH = False        # 关闭四天跌5%急跌（由分层利润保护替代）
 PROFIT_PROTECTION = True       # 启用分层利润保护（基于PROT_ADJ）
-N_JOBS = 8                     # 多进程并行数
+N_JOBS = 1                     # 32位Python，单进程跑（避免spawn OOM）
 
 print("=" * 60)
-print("F1+F2+F3 策略 — 2025年核心池回测")
+print("F1+F2+F3 策略 — 2025.01-2026.04 核心池回测")
 print("=" * 60)
 print(f"回测区间: {START_DATE} → {END_DATE}")
 print(f"初始资金: {INITIAL_CASH:,.0f}")

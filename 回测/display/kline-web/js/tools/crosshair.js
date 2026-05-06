@@ -250,6 +250,23 @@ Crosshair.prototype.drawCandleInfo = function(ctx) {
         }
     }
 
+    // 查找换手率
+    var turnoverStr = '--';
+    if (typeof TURNOVER_DATA !== 'undefined' && typeof TURNOVER_DATES !== 'undefined') {
+        var rawCode = this.klineChart.currentStockCode;
+        if (rawCode) {
+            var code6 = rawCode.replace(/^(sh|sz|bj)/i, '');
+            var tData = TURNOVER_DATA[code6];
+            if (tData) {
+                var dateStr = candle.date || candle.day || '';
+                var dIdx = TURNOVER_DATES.indexOf(dateStr);
+                if (dIdx >= 0 && dIdx < tData.length && tData[dIdx] != null) {
+                    turnoverStr = tData[dIdx].toFixed(2) + '%';
+                }
+            }
+        }
+    }
+
     // 准备信息文本
     var lines = [
         '日期: ' + (candle.date || ''),
@@ -260,7 +277,7 @@ Crosshair.prototype.drawCandleInfo = function(ctx) {
         '涨跌: ' + changeValue + ' (' + changePercent + '%)',
         '成交量: ' + formatVolume(candle.volume || 0),
         '成交额: ' + formatAmount(candle.amount || 0),
-        '换手: --'
+        '换手: ' + turnoverStr
     ];
 
     // 计算窗口尺寸

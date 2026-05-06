@@ -49,8 +49,8 @@ def main():
             continue
         try:
             lines = compute_moving_stop(df)
-            # 过滤有效值
-            prot_adj = lines["prot_adj"]
+            # 过滤有效值（让利修正_日线）
+            prot_adj = lines["rangli_adjusted"]
             valid = prot_adj.notna() & (prot_adj > 0)
 
             # 输出格式: {date: value}，只保留有效日期

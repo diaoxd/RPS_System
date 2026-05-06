@@ -10,7 +10,7 @@ from typing import List, Optional
 
 import pandas as pd
 
-from .data_loader import load_all_stock_data
+from .data_loader import load_all_stock_data, _POOL_SNAPSHOT_PATH
 
 
 def _compute_single_stock(args):
@@ -51,7 +51,8 @@ class TradeRecord:
     commission: float
     pnl: float = 0.0  # 卖出时的净利润
     hold_days: int = 0  # 卖出时的持仓天数
-    reason: str = "signal"  # 'signal' | 'stop_loss' | 'take_profit' | 'trailing_stop'
+    reason: str = "signal"  # 买入原因或卖出原因
+    reason_detail: any = None  # 买入原因详解（dict）或卖出原因说明（str）
 
 
 @dataclass
@@ -192,6 +193,8 @@ class BacktestEngine:
 
     def run(self):
         """执行回测"""
+        import time
+
         if not self.strategy:
             raise ValueError("请先通过 set_strategy() 设置策略")
 
@@ -199,22 +202,64 @@ class BacktestEngine:
             print(f"\n策略: {self.strategy.name}")
             print(f"参数: {self.strategy.params}\n")
 
-        # 1. 加载数据
+        timings = {}
+
+        # 1. 加载数据（池快照 + 日线，只加载池内出现过的股票）
+        t0 = time.time()
         self._load_data()
+        timings["1.数据加载(快照+日线)"] = time.time() - t0
 
-        # 2. 策略计算信号
+        # 2. 并行计算所有候选股票的信号（只算池内股票，8进程）
+        t0 = time.time()
         self._compute_signals()
+        timings["2.信号计算(并行)"] = time.time() - t0
 
-        # 3. 主循环
+        # 3. 逐日回测（池查询用快照，买卖只检查池内+持仓）
+        t0 = time.time()
         self._run_loop()
+        timings["3.逐日回测"] = time.time() - t0
 
         # 4. 构建结果
-        return self._build_result()
+        t0 = time.time()
+        result = self._build_result()
+        timings["4.结果构建"] = time.time() - t0
+
+        if self._verbose:
+            print(f"\n{'=' * 42}")
+            print("  各阶段耗时统计")
+            print(f"{'=' * 42}")
+            total = 0
+            for phase, sec in timings.items():
+                print(f"  {phase}: {sec:.1f}s")
+                total += sec
+            print(f"  {'─' * 30}")
+            print(f"  总耗时: {total:.1f}s")
+
+        return result
 
     def _load_data(self):
-        """加载所有股票数据"""
-        if self.block_pool is not None:
-            # 动态池：从回测日期范围内收集候选股票（所有出现过核心池的日期）
+        """加载池快照 + 日线数据（只加载池内出现过的股票）"""
+        import pickle
+
+        # 加载预计算的池快照
+        if os.path.exists(_POOL_SNAPSHOT_PATH):
+            print(f"加载池快照 ({os.path.getsize(_POOL_SNAPSHOT_PATH)/1024/1024:.0f} MB)...")
+            with open(_POOL_SNAPSHOT_PATH, "rb") as f:
+                self._pool_snapshots = pickle.load(f)
+
+            # 从快照提取候选股票（回测区间内去重）
+            all_stocks = set()
+            for date_str, stocks in self._pool_snapshots.items():
+                date = pd.Timestamp(date_str)
+                if self._date_start and date < self._date_start:
+                    continue
+                if self._date_end and date > self._date_end:
+                    continue
+                all_stocks.update(stocks)
+            self.stock_codes = sorted(all_stocks)
+            print(f"  候选股票: {len(self.stock_codes)} 只 (池快照)")
+        elif self.block_pool is not None:
+            # fallback: 逐日查DB
             print("收集动态池候选股票...")
             all_stocks = set()
             for date in self.block_pool.get_all_dates():
@@ -225,7 +270,9 @@ class BacktestEngine:
                 stocks = self.block_pool.get_pool_stocks(date, self._pool_tags)
                 all_stocks.update(stocks)
             self.stock_codes = sorted(all_stocks)
-            print(f"  候选股票: {len(self.stock_codes)} 只")
+            print(f"  候选股票: {len(self.stock_codes)} 只 (DB查询)")
+        else:
+            self._pool_snapshots = None
 
         print("加载股票数据...")
         self.data = load_all_stock_data(
@@ -252,26 +299,47 @@ class BacktestEngine:
             print(f"  [OK] 共 {len(self.signals)} 只股票, {total_signals} 条信号")
 
     def _compute_signals_sequential(self):
-        """单进程顺序计算"""
-        for code, df in self.data.items():
-            df_out = self.strategy.compute(df.copy())
-            self._validate_and_store(code, df_out)
+        """单进程顺序计算（带日志）"""
+        total = len(self.data)
+        for i, (code, df) in enumerate(self.data.items()):
+            try:
+                df_out = self.strategy.compute(df.copy())
+                self._validate_and_store(code, df_out)
+            except Exception:
+                pass
+            if self._verbose and (i + 1) % 500 == 0:
+                print(f"  [信号] {i+1}/{total} ({(i+1)/total*100:.0f}%)")
 
     def _compute_signals_parallel(self):
-        """多进程并行计算"""
-        from concurrent.futures import ProcessPoolExecutor
+        """多进程并行计算（分批提交，避免内存溢出）"""
+        from concurrent.futures import ProcessPoolExecutor, as_completed
 
-        # 将 DataFrame 转为 dict 以便序列化
         tasks = []
         for code, df in self.data.items():
             df_dict = df.reset_index().to_dict("list")
             tasks.append((code, df_dict, self.strategy))
 
+        total = len(tasks)
+        done = 0
+        BATCH = 500  # 每批500只，避免一次提交过多任务
+
         with ProcessPoolExecutor(max_workers=self._n_jobs) as executor:
-            futures = [executor.submit(_compute_single_stock, t) for t in tasks]
-            for future in futures:
-                code, df_out = future.result()
-                self._validate_and_store(code, df_out)
+            for batch_start in range(0, total, BATCH):
+                batch = tasks[batch_start:batch_start + BATCH]
+                futures = {executor.submit(_compute_single_stock, t): t[0] for t in batch}
+
+                for future in as_completed(futures):
+                    code = futures[future]
+                    try:
+                        code_out, df_out = future.result()
+                        self._validate_and_store(code_out, df_out)
+                    except Exception:
+                        pass  # 单只失败不影响整体
+                    done += 1
+
+                if self._verbose:
+                    pct = min(done, total) / total * 100
+                    print(f"  [信号] {done}/{total} ({pct:.0f}%)")
 
     def _validate_and_store(self, code, df_out):
         """验证策略输出并存储"""
@@ -284,15 +352,14 @@ class BacktestEngine:
         self.signals[code] = df_out
 
     def _run_loop(self):
-        """逐日回测主循环"""
-        # 收集所有日期并排序
+        """逐日回测主循环 —— 用池快照代替DB查询，只遍历池内+持仓"""
+        # 收集所有日期并排序（从信号数据）
         all_dates = sorted(
             set().union(*[set(df.index) for df in self.signals.values()])
         )
         if not all_dates:
             raise RuntimeError("信号数据为空，无法回测")
 
-        # 过滤日期范围
         if self._date_start:
             all_dates = [d for d in all_dates if d >= self._date_start]
         if self._date_end:
@@ -306,22 +373,29 @@ class BacktestEngine:
         self.daily_equity = []
         self._risk_trade_count = 0
 
+        # 快照字典：date_str → set(stock_codes)
+        snapshots = getattr(self, "_pool_snapshots", None)
+
         if self._verbose:
             print(f"\n开始回测...  ({all_dates[0].date()} ~ {all_dates[-1].date()})")
             print(f"初始资金: {self.cash:,.2f}")
-            print(f"股票数量: {len(self.signals)}")
+            print(f"信号股票: {len(self.signals)} 只")
+            print(f"池快照:   {'有' if snapshots else '无(查DB)'}")
 
         bar_interval = max(len(all_dates) // 10, 1)
 
         for t, date in enumerate(all_dates):
-            # ---- 第0遍：计算今日池内股票（仅用于买入过滤） ----
+            # ---- 第0遍：池内股票（快照或DB查询） ----
+            date_str = date.strftime("%Y%m%d")
             pool_stocks_today = None
-            if self.block_pool is not None:
+            if snapshots is not None:
+                pool_stocks_today = set(snapshots.get(date_str, []))
+            elif self.block_pool is not None:
                 pool_stocks_today = set(
                     self.block_pool.get_pool_stocks(date, self._pool_tags)
                 )
 
-            # ---- 第一遍：先处理风控（卖出） ----
+            # ---- 第一遍：风控卖出（仅检查持仓） ----
             risk_sells_today = []
             for code, pos in list(self.positions.items()):
                 if code not in self.signals or date not in self.signals[code].index:
@@ -330,23 +404,29 @@ class BacktestEngine:
                 if self._check_stops(code, row, date):
                     risk_sells_today.append(code)
 
-            # ---- 第二遍：处理策略信号（卖出 → 买入） ----
-            for code in self.signals:
-                if date not in self.signals[code].index:
+            # ---- 第二遍：卖出信号（仅检查持仓）→ 买入信号（仅检查池内未持仓） ----
+            # 卖出：只遍历持仓
+            for code in list(self.positions.keys()):
+                if code in risk_sells_today:
+                    continue
+                if code not in self.signals or date not in self.signals[code].index:
                     continue
                 row = self.signals[code].loc[date]
-                signal = int(row["signal"])
-                pos_shares = self.positions.get(code, {}).get("shares", 0)
-
-                if signal == -1 and pos_shares > 0 and code not in risk_sells_today:
-                    # 策略卖出
+                if int(row["signal"]) == -1:
                     self._sell(code, row, date, reason="signal")
-                elif signal == 1 and pos_shares == 0:
-                    # 策略买入 —— 动态池检查
-                    if pool_stocks_today is None or code in pool_stocks_today:
+
+            # 买入：只遍历池内未持仓股票
+            if pool_stocks_today:
+                for code in pool_stocks_today:
+                    if code in self.positions:
+                        continue
+                    if code not in self.signals or date not in self.signals[code].index:
+                        continue
+                    row = self.signals[code].loc[date]
+                    if int(row["signal"]) == 1:
                         self._buy(code, row, date)
 
-            # ---- 第三遍：更新持仓股票的最高价和最大浮盈（用于下一日风控） ----
+            # ---- 第三遍：更新持仓最高价和最大浮盈 ----
             for code, pos in self.positions.items():
                 if date in self.signals[code].index:
                     row = self.signals[code].loc[date]
@@ -465,6 +545,15 @@ class BacktestEngine:
         if price <= 0:
             return
 
+        # 策略可以输出 _buy_reason / _buy_reason_detail 覆盖默认买入原因
+        if "_buy_reason" in row.index and row["_buy_reason"]:
+            reason = str(row["_buy_reason"])
+        detail = None
+        if "_buy_reason_detail" in row.index and row["_buy_reason_detail"]:
+            detail = row["_buy_reason_detail"]
+            if hasattr(detail, "item"):  # numpy/scalar
+                detail = detail.item()
+
         # 计算总资产 = 现金 + 持仓市值
         total_equity = self._current_equity(date)
 
@@ -501,6 +590,8 @@ class BacktestEngine:
                 shares=shares,
                 amount=amount,
                 commission=commission,
+                reason=reason,
+                reason_detail=detail,
             )
         )
 

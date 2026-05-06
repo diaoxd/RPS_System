@@ -97,15 +97,16 @@ def compute_signal(df, sell_mode="prot_adj"):
     MA5 = MA(C, 5)
     MA10 = MA(C, 10)
     MA20 = MA(C, 20)
+    MA30 = MA(C, 30)
     MA60 = MA(C, 60)
 
-    # F1: 均线多头 + 斜率>0
-    ma_order = (MA5 > MA10) & (MA10 > MA20) & (MA20 > MA60)
-    ma5_up = MA5 > REF(MA5, 1)
-    ma10_up = MA10 > REF(MA10, 1)
-    ma20_up = MA20 > REF(MA20, 1)
+    # F1: 均线趋势向上
     ma60_up = MA60 > REF(MA60, 1)
-    cond_f1 = ma_order & ma5_up & ma10_up & ma20_up & ma60_up
+    ma20_up = MA20 > REF(MA20, 1)
+    ma30_up = MA30 > REF(MA30, 1)
+    trend_ok = ma30_up | ma20_up
+    ma5_slope_ok = MA5 >= REF(MA5, 1)
+    cond_f1 = ma60_up & trend_ok & ma5_slope_ok
 
     # F2: 近20天有过涨停
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -113,8 +114,13 @@ def compute_signal(df, sell_mode="prot_adj"):
     has_zt = daily_ret >= 1.098
     cond_f2 = COUNT(has_zt.astype(float), 20) >= 1
 
-    # F3: 收盘在5日线上
-    cond_f3 = C > MA5
+    # F3: CROSS(C,MA5) + MA5斜率确认（允许次日补买）
+    cross_ma5 = (C > MA5) & (REF(C, 1) <= REF(MA5, 1))
+    f3_same_day = cross_ma5 & ma5_slope_ok
+    cross_yday_bad = cross_ma5 & ~ma5_slope_ok
+    delayed_ok = (REF(cross_yday_bad.astype(float), 1).astype(bool)
+                  & (C > MA5) & (MA5 >= REF(MA5, 1)))
+    cond_f3 = f3_same_day | delayed_ok
 
     qualified = cond_f1 & cond_f2 & cond_f3
     buy = qualified & ~REF(qualified.astype(float), 1).astype(bool)
@@ -122,7 +128,7 @@ def compute_signal(df, sell_mode="prot_adj"):
     # ---- 卖出信号 ----
     if sell_mode == "prot_adj":
         lines = compute_moving_stop(df)
-        prot_adj = lines["prot_adj"].values
+        prot_adj = lines["rangli_adjusted"].values
         drop5_stop = lines["drop5_stop"].values
         L = df["Low"].values.astype(float)
         # ① 收盘价跌破 PROT_ADJ 修正止盈线
@@ -141,7 +147,7 @@ def compute_signal(df, sell_mode="prot_adj"):
     df["price"] = C
     df["prot_adj"] = prot_adj
 
-    valid = ~np.isnan(MA60)
+    valid = ~np.isnan(MA60) & ~np.isnan(MA30)
     if sell_mode == "prot_adj":
         valid = valid & ~np.isnan(prot_adj)
     return df.loc[valid]
@@ -233,7 +239,7 @@ def main():
     from bt_framework.block_pool import BlockPoolSelector
 
     print("=" * 60)
-    print("逐只股票回测 — 2025年 三池 + F1+F2+F3 (4进程)")
+    print("逐只股票回测 — 2025年 三池 + F1(MA趋势)+F2(涨停)+F3(CROSS_MA5) (4进程)")
     print("=" * 60)
     print(f"回测区间: {START_DATE} → {END_DATE}")
     print(f"池标签:   {POOL_TAGS}")
